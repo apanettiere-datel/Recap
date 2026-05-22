@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: recap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-recap}
+      POSTGRES_DB: recap
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://recap:${POSTGRES_PASSWORD:-recap}@db:5432/recap
+      NODE_ENV: production
+      PORT: "3000"
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
+  uploads:

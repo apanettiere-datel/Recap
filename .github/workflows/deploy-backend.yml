@@ -1,0 +1,84 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write env file to server
+        uses: appleboy/ssh-action@v1
+        env:
+          DB_URL: ${{ secrets.DATABASE_URL }}
+          OAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FB_PROJECT: ${{ secrets.FIREBASE_PROJECT_ID }}
+          PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
+        with:
+          host: ${{ secrets.LIGHTSAIL_HOST }}
+          username: ubuntu
+          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          envs: DB_URL,OAI_KEY,FB_PROJECT,PG_PASS
+          script: |
+            mkdir -p ~/recap/backend
+            cat > ~/recap/backend/.env << EOF
+            DATABASE_URL=${DB_URL}
+            OPENAI_API_KEY=${OAI_KEY}
+            FIREBASE_PROJECT_ID=${FB_PROJECT}
+            POSTGRES_PASSWORD=${PG_PASS}
+            NODE_ENV=production
+            PORT=3000
+            EOF
+
+      - name: Deploy application
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.LIGHTSAIL_HOST }}
+          username: ubuntu
+          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          script_stop: true
+          script: |
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              curl -fsSL https://get.docker.com | sh
+              sudo usermod -aG docker ubuntu
+              newgrp docker
+            fi
+
+            # Clone or pull latest code
+            if [ ! -d ~/recap/.git ]; then
+              git clone https://github.com/${{ github.repository }}.git ~/recap
+            else
+              cd ~/recap && git fetch origin && git reset --hard origin/main
+            fi
+
+            cd ~/recap/backend
+
+            # Build and restart containers
+            docker compose down || true
+            docker compose up -d --build --remove-orphans
+
+            # Run database migrations
+            docker compose exec -T api node -e "
+              import('drizzle-orm/node-postgres/migrator').then(m =>
+                m.migrate(require('./dist/services/db.js').db, { migrationsFolder: './drizzle' })
+              ).catch(() => process.exit(0))
+            " || true
+
+            # Wait for health check
+            echo "Waiting for API to start..."
+            for i in $(seq 1 20); do
+              if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+                echo "API is healthy!"
+                exit 0
+              fi
+              sleep 3
+            done
+            echo "Health check failed — showing logs:"
+            docker compose logs --tail=30 api
+            exit 1
