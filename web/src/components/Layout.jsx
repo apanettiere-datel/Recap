@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import { useTheme } from '@/lib/theme'
+import { UserButton } from '@clerk/clerk-react'
 
 const CLERK_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
 
@@ -82,13 +83,8 @@ export default function Layout() {
   )
 }
 
-function ClerkUser({ theme }) {
-  let UserButton
-  try {
-    ;({ UserButton } = require('@clerk/clerk-react'))
-  } catch {
-    return null
-  }
+function ClerkUser() {
+  if (!CLERK_KEY) return null
   return (
     <div className="mt-3">
       <UserButton
