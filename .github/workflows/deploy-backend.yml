@@ -23,7 +23,7 @@ jobs:
           envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS
           script: |
             mkdir -p ~/recap/backend
-            cat > ~/recap/backend/.env << EOF
+            cat > ~/recap/backend/.env <<EOF
             DATABASE_URL=${DB_URL}
             OPENAI_API_KEY=${OAI_KEY}
             CLERK_SECRET_KEY=${CLERK_SK}
@@ -31,6 +31,7 @@ jobs:
             NODE_ENV=production
             PORT=3000
             EOF
+            sed -i 's/^[[:space:]]*//' ~/recap/backend/.env
 
       - name: Deploy application
         uses: appleboy/ssh-action@v1
@@ -41,16 +42,16 @@ jobs:
           username: ubuntu
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: CLERK_PK
-          script_stop: true
           script: |
+            set -e
+
             # Install Docker if not present
             if ! command -v docker &> /dev/null; then
               curl -fsSL https://get.docker.com | sh
               sudo usermod -aG docker ubuntu
-              newgrp docker
             fi
 
-            # Install Node.js if not present (for frontend build)
+            # Install Node.js if not present
             if ! command -v node &> /dev/null; then
               curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
               sudo apt-get install -y nodejs
@@ -79,33 +80,30 @@ jobs:
 
             # Build and restart backend containers
             cd ~/recap/backend
-            docker compose down || true
-            docker compose up -d --build --remove-orphans
+            docker compose -f docker-compose.yml down || true
+            docker compose -f docker-compose.yml up -d --build --remove-orphans
 
             # Run database migrations
-            sleep 5
+            sleep 10
             for migration in ~/recap/backend/drizzle/0*.sql; do
-              docker compose exec -T db psql -U recap -d recap -f /dev/stdin < "$migration" 2>/dev/null || true
+              [ -f "$migration" ] || continue
+              docker compose -f docker-compose.yml exec -T db psql -U recap -d recap -f /dev/stdin < "$migration" 2>/dev/null || true
             done
 
             # Configure nginx
-            sudo tee /etc/nginx/sites-available/personalrecap > /dev/null << 'NGINX'
+            sudo tee /etc/nginx/sites-available/personalrecap > /dev/null <<'NGINX'
             server {
                 listen 80;
                 server_name personalrecap.com www.personalrecap.com;
-
                 root /var/www/personalrecap;
                 index index.html;
-
                 location / {
                     try_files $uri $uri/ /index.html;
                 }
             }
-
             server {
                 listen 80;
                 server_name api.personalrecap.com;
-
                 location / {
                     proxy_pass http://127.0.0.1:3001;
                     proxy_set_header Host $host;
@@ -116,13 +114,15 @@ jobs:
                 }
             }
             NGINX
+            sudo sed -i 's/^            //' /etc/nginx/sites-available/personalrecap
 
             sudo ln -sf /etc/nginx/sites-available/personalrecap /etc/nginx/sites-enabled/
-            sudo nginx -t && sudo systemctl reload nginx
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t && sudo systemctl restart nginx
 
             # Wait for health check
             echo "Waiting for API to start..."
-            for i in $(seq 1 20); do
+            for i in $(seq 1 30); do
               if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
                 echo "API is healthy!"
                 exit 0
@@ -130,5 +130,5 @@ jobs:
               sleep 3
             done
             echo "Health check failed — showing logs:"
-            docker compose logs --tail=30 api
+            docker compose -f docker-compose.yml logs --tail=50 api
             exit 1
