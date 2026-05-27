@@ -70,6 +70,7 @@ export default function NoteDetail() {
   const { data: note, isLoading, error } = useQuery({
     queryKey: ['note', id],
     queryFn: () => api.get(`/notes/${id}`),
+    refetchInterval: (query) => query.state.data?.isProcessing ? 2000 : false,
   })
 
   const toggleCommitment = useMutation({
@@ -193,6 +194,24 @@ export default function NoteDetail() {
       </div>
 
       <div className="max-w-2xl mx-auto px-4 pt-6">
+        {/* Processing indicator */}
+        {note.isProcessing && (
+          <div className="mb-6 flex items-center gap-3 px-4 py-3 rounded-2xl bg-blue-500/10 border border-blue-500/20">
+            <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+            <div>
+              <p className="text-sm font-medium text-blue-600 dark:text-blue-400">Processing your recording...</p>
+              <p className="text-xs text-blue-500/70 dark:text-blue-400/60 mt-0.5">Transcribing audio and extracting insights</p>
+            </div>
+          </div>
+        )}
+
+        {note.processingError && (
+          <div className="mb-6 px-4 py-3 rounded-2xl bg-red-500/10 border border-red-500/20">
+            <p className="text-sm font-medium text-red-600 dark:text-red-400">Processing failed</p>
+            <p className="text-xs text-red-500/70 mt-0.5">{note.processingError}</p>
+          </div>
+        )}
+
         {/* Title & meta */}
         {editingTitle ? (
           <input

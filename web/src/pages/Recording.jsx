@@ -38,6 +38,7 @@ export default function Recording() {
       const formData = new FormData()
       formData.append('audio', blob, 'recording.webm')
       formData.append('mode', 'conversation')
+      formData.append('duration', String(elapsed))
       if (personId) {
         formData.append('personId', personId)
       }

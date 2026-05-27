@@ -107,7 +107,8 @@ export async function processNote(noteId: string, userId: string) {
     }
 
     // Enrich people with extracted entities (phone, email, org)
-    await enrichPeopleFromEntities(userId, analysis.entities, analysis.people);
+    console.log(`[processNote] entities detected:`, JSON.stringify(analysis.entities?.map(e => `${e.type}:${e.text}`) || []));
+    await enrichPeopleFromEntities(userId, noteId, analysis.entities, analysis.people);
 
     // Auto-generate insights after processing
     generateInsights(userId).catch((e) => console.error("[processNote] insights generation failed:", e));
@@ -121,7 +122,7 @@ export async function processNote(noteId: string, userId: string) {
   }
 }
 
-async function enrichPeopleFromEntities(userId: string, entities: Entity[], personNames: string[]) {
+async function enrichPeopleFromEntities(userId: string, noteId: string, entities: Entity[], personNames: string[]) {
   if (!entities || entities.length === 0) return;
 
   const phones = entities.filter(e => e.type === "PHONE");
@@ -156,19 +157,22 @@ async function enrichPeopleFromEntities(userId: string, entities: Entity[], pers
       }
     }
 
-    // Create org as a trackable entity
-    const existing = await db
+    // Create org as a trackable entity and link to note
+    let [orgEntry] = await db
       .select()
       .from(people)
       .where(and(eq(people.userId, userId), eq(people.name, orgName)))
       .limit(1);
-    if (existing.length === 0) {
-      await db.insert(people).values({
+    if (!orgEntry) {
+      [orgEntry] = await db.insert(people).values({
         userId,
         name: orgName,
         relationship: "organization",
         organization: orgName,
-      });
+      }).returning();
+    }
+    if (orgEntry) {
+      await db.insert(notePeople).values({ noteId, personId: orgEntry.id }).onConflictDoNothing();
     }
   }
 }

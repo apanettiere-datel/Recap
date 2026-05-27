@@ -62,11 +62,16 @@ function NoteCard({ note, onClick }) {
         </span>
       </div>
 
-      {note.summary && (
+      {note.isProcessing ? (
+        <div className="flex items-center gap-2 mb-3">
+          <div className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          <span className="text-sm text-blue-500 font-medium">Processing...</span>
+        </div>
+      ) : note.summary ? (
         <p className="text-sm text-neutral-600 dark:text-neutral-400 line-clamp-2 mb-3 leading-relaxed">
           {note.summary}
         </p>
-      )}
+      ) : null}
 
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -148,6 +153,7 @@ export default function Feed() {
   const { data: notes, isLoading, error } = useQuery({
     queryKey: ['notes'],
     queryFn: () => api.get('/notes'),
+    refetchInterval: (query) => query.state.data?.some(n => n.isProcessing) ? 3000 : false,
   })
 
   const { data: people } = useQuery({

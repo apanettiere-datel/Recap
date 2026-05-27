@@ -46,9 +46,23 @@ export default function AudioPlayer({ audioUrl, duration: initialDuration }) {
   }, [])
 
   const handleLoadedMetadata = () => {
-    if (audioRef.current) {
+    if (!audioRef.current) return
+    const d = audioRef.current.duration
+    if (d && isFinite(d)) {
+      setDuration(d)
+      setIsLoaded(true)
+    } else {
+      // WebM from MediaRecorder often has Infinity duration — force browser to calculate it
+      audioRef.current.currentTime = 1e10
+    }
+  }
+
+  const handleTimeUpdate = () => {
+    if (!audioRef.current) return
+    if (!isLoaded && audioRef.current.duration && isFinite(audioRef.current.duration)) {
       setDuration(audioRef.current.duration)
       setIsLoaded(true)
+      audioRef.current.currentTime = 0
     }
   }
 
@@ -94,6 +108,13 @@ export default function AudioPlayer({ audioUrl, duration: initialDuration }) {
         src={audioUrl}
         preload="metadata"
         onLoadedMetadata={handleLoadedMetadata}
+        onTimeUpdate={handleTimeUpdate}
+        onDurationChange={() => {
+          if (audioRef.current?.duration && isFinite(audioRef.current.duration)) {
+            setDuration(audioRef.current.duration)
+            setIsLoaded(true)
+          }
+        }}
         onEnded={handleEnded}
       />
 

@@ -19,6 +19,7 @@ app.post("/", async (c) => {
   const audio = body["audio"] as File;
   const mode = (body["mode"] as string) ?? "general";
   const personId = (body["personId"] as string) || null;
+  const duration = parseFloat((body["duration"] as string) || "0") || 0;
 
   if (!audio) return c.json({ error: "No audio file" }, 400);
 
@@ -37,7 +38,7 @@ app.post("/", async (c) => {
     .values({
       userId,
       audioUrl,
-      duration: 0,
+      duration,
       conversationMode: mode,
     })
     .returning();
