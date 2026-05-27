@@ -33,9 +33,13 @@ app.use("/api/*", rateLimiter);
 app.route("/api/users", usersRoutes);
 
 // All other routes need a resolved user
+app.use("/api/notes", resolveUser);
 app.use("/api/notes/*", resolveUser);
+app.use("/api/people", resolveUser);
 app.use("/api/people/*", resolveUser);
+app.use("/api/commitments", resolveUser);
 app.use("/api/commitments/*", resolveUser);
+app.use("/api/insights", resolveUser);
 app.use("/api/insights/*", resolveUser);
 app.use("/api/briefing/*", resolveUser);
 
