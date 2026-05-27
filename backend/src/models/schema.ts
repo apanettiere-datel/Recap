@@ -48,6 +48,7 @@ export const people = pgTable("people", {
   keywords: text("keywords").array().default([]).notNull(),
   phone: text("phone"),
   email: text("email"),
+  role: text("role"),
   organization: text("organization"),
   notes: text("notes").default("").notNull(),
   lastContactDate: timestamp("last_contact_date"),
@@ -64,6 +65,7 @@ export const commitments = pgTable("commitments", {
   status: commitmentStatusEnum("status").default("open").notNull(),
   dueDate: timestamp("due_date"),
   completedAt: timestamp("completed_at"),
+  priority: text("priority").default("medium"),
   addedToCalendar: boolean("added_to_calendar").default(false).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
@@ -86,6 +88,14 @@ export const quotes = pgTable("quotes", {
   personId: uuid("person_id").references(() => people.id, { onDelete: "set null" }),
   text: text("text").notNull(),
   speaker: text("speaker").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const tags = pgTable("tags", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  noteId: uuid("note_id").notNull().references(() => notes.id, { onDelete: "cascade" }),
+  label: text("label").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -126,6 +136,7 @@ export const notesRelations = relations(notes, ({ one, many }) => ({
   topics: many(topics),
   quotes: many(quotes),
   notePeople: many(notePeople),
+  tags: many(tags),
 }));
 
 export const peopleRelations = relations(people, ({ one, many }) => ({
@@ -139,4 +150,9 @@ export const commitmentsRelations = relations(commitments, ({ one }) => ({
   note: one(notes, { fields: [commitments.noteId], references: [notes.id] }),
   person: one(people, { fields: [commitments.personId], references: [people.id] }),
   user: one(users, { fields: [commitments.userId], references: [users.id] }),
+}));
+
+export const tagsRelations = relations(tags, ({ one }) => ({
+  note: one(notes, { fields: [tags.noteId], references: [notes.id] }),
+  user: one(users, { fields: [tags.userId], references: [users.id] }),
 }));

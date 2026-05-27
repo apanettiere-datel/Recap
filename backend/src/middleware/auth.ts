@@ -1,13 +1,8 @@
 import { Context, Next } from "hono";
-import admin from "firebase-admin";
+import { verifyToken } from "@clerk/backend";
 
 const DEV_MODE = process.env.NODE_ENV !== "production";
-
-if (!DEV_MODE && !admin.apps.length) {
-  admin.initializeApp({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-  });
-}
+const CLERK_SECRET = process.env.CLERK_SECRET_KEY;
 
 export async function authMiddleware(c: Context, next: Next) {
   const header = c.req.header("Authorization");
@@ -17,7 +12,7 @@ export async function authMiddleware(c: Context, next: Next) {
 
   const token = header.slice(7);
 
-  // Dev mode: skip Firebase, use a fixed test identity
+  // Dev mode: skip verification, use a fixed test identity
   if (DEV_MODE && token === "dev-token") {
     c.set("firebaseUid", "dev-user-001");
     c.set("email", "dev@recap.test");
@@ -25,10 +20,14 @@ export async function authMiddleware(c: Context, next: Next) {
     return;
   }
 
+  if (!CLERK_SECRET) {
+    return c.json({ error: "Auth not configured" }, 500);
+  }
+
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    c.set("firebaseUid", decoded.uid);
-    c.set("email", decoded.email);
+    const payload = await verifyToken(token, { secretKey: CLERK_SECRET });
+    c.set("firebaseUid", payload.sub);
+    c.set("email", (payload as any).email || "");
     await next();
   } catch {
     return c.json({ error: "Invalid token" }, 401);

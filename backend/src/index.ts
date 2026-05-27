@@ -9,6 +9,7 @@ import peopleRoutes from "./routes/people.js";
 import commitmentsRoutes from "./routes/commitments.js";
 import insightsRoutes from "./routes/insights.js";
 import usersRoutes from "./routes/users.js";
+import briefingRoutes from "./routes/briefing.js";
 import { startWeeklyJobs } from "./jobs/weekly.js";
 
 const app = new Hono();
@@ -36,6 +37,7 @@ app.use("/api/notes/*", resolveUser);
 app.use("/api/people/*", resolveUser);
 app.use("/api/commitments/*", resolveUser);
 app.use("/api/insights/*", resolveUser);
+app.use("/api/briefing/*", resolveUser);
 
 // Audio upload limit: 50MB
 app.use("/api/notes", validateContentLength(50 * 1024 * 1024));
@@ -45,6 +47,7 @@ app.route("/api/notes", notesRoutes);
 app.route("/api/people", peopleRoutes);
 app.route("/api/commitments", commitmentsRoutes);
 app.route("/api/insights", insightsRoutes);
+app.route("/api/briefing", briefingRoutes);
 
 const port = parseInt(process.env.PORT ?? "3000");
 

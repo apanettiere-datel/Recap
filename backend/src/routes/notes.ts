@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { db } from "../services/db.js";
-import { notes, commitments, topics, people, notePeople, quotes } from "../models/schema.js";
-import { eq, and, desc, like, or, sql } from "drizzle-orm";
+import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
+import { eq, and, desc, like, or, sql, inArray } from "drizzle-orm";
 import { processNote } from "../services/processing.js";
 import { writeFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -18,6 +18,7 @@ app.post("/", async (c) => {
   const body = await c.req.parseBody();
   const audio = body["audio"] as File;
   const mode = (body["mode"] as string) ?? "general";
+  const personId = (body["personId"] as string) || null;
 
   if (!audio) return c.json({ error: "No audio file" }, 400);
 
@@ -40,10 +41,57 @@ app.post("/", async (c) => {
     })
     .returning();
 
+  if (personId) {
+    await db.insert(notePeople).values({ noteId: note.id, personId });
+    await db
+      .update(people)
+      .set({ lastContactDate: new Date() })
+      .where(and(eq(people.id, personId), eq(people.userId, userId)));
+  }
+
   // Process async
   processNote(note.id, userId).catch(console.error);
 
   return c.json({ id: note.id, status: "processing" }, 201);
+});
+
+// Create text note (no audio)
+app.post("/text", async (c) => {
+  const userId = c.get("userId") as string;
+  const body = await c.req.json<{
+    title: string;
+    content: string;
+    people?: string[];
+  }>();
+
+  if (!body.title?.trim()) return c.json({ error: "Title required" }, 400);
+  if (!body.content?.trim()) return c.json({ error: "Content required" }, 400);
+
+  const [note] = await db
+    .insert(notes)
+    .values({
+      userId,
+      title: body.title.trim(),
+      transcript: body.content.trim(),
+      summary: body.content.trim().length < 200 ? body.content.trim() : "",
+      sentiment: "neutral",
+      audioUrl: "",
+      duration: 0,
+      isProcessing: false,
+    })
+    .returning();
+
+  if (body.people?.length) {
+    await db.insert(notePeople).values(
+      body.people.map((personId) => ({ noteId: note.id, personId }))
+    );
+    await db
+      .update(people)
+      .set({ lastContactDate: new Date() })
+      .where(and(eq(people.userId, userId), inArray(people.id, body.people)));
+  }
+
+  return c.json(note, 201);
 });
 
 // Get all notes for user
@@ -83,12 +131,74 @@ app.get("/", async (c) => {
         .from(quotes)
         .where(eq(quotes.noteId, note.id));
 
+      const noteTags = await db
+        .select()
+        .from(tags)
+        .where(eq(tags.noteId, note.id));
+
       return {
         ...note,
         commitments: noteCommitments,
         topics: noteTopics.map((t) => t.label),
         people: notePeopleRows.map((r) => r.person),
         quotes: noteQuotes,
+        tags: noteTags,
+      };
+    })
+  );
+
+  return c.json(withRelations);
+});
+
+// Get archived notes
+app.get("/archived", async (c) => {
+  const userId = c.get("userId") as string;
+  const limit = parseInt(c.req.query("limit") ?? "50");
+  const offset = parseInt(c.req.query("offset") ?? "0");
+
+  const archivedNotes = await db
+    .select()
+    .from(notes)
+    .where(and(eq(notes.userId, userId), eq(notes.isArchived, true)))
+    .orderBy(desc(notes.recordedAt))
+    .limit(limit)
+    .offset(offset);
+
+  const withRelations = await Promise.all(
+    archivedNotes.map(async (note) => {
+      const noteCommitments = await db
+        .select()
+        .from(commitments)
+        .where(eq(commitments.noteId, note.id));
+
+      const noteTopics = await db
+        .select()
+        .from(topics)
+        .where(eq(topics.noteId, note.id));
+
+      const notePeopleRows = await db
+        .select({ person: people })
+        .from(notePeople)
+        .innerJoin(people, eq(notePeople.personId, people.id))
+        .where(eq(notePeople.noteId, note.id));
+
+      const noteQuotes = await db
+        .select()
+        .from(quotes)
+        .where(eq(quotes.noteId, note.id));
+
+      const noteTags = await db
+        .select()
+        .from(tags)
+        .where(eq(tags.noteId, note.id));
+
+      return {
+        ...note,
+        commitments: noteCommitments,
+        topics: noteTopics.map((t) => t.label),
+        people: notePeopleRows.map((r) => r.person),
+        quotes: noteQuotes,
+        tags: noteTags,
       };
     })
   );
@@ -116,6 +226,7 @@ app.get("/:id", async (c) => {
     .innerJoin(people, eq(notePeople.personId, people.id))
     .where(eq(notePeople.noteId, noteId));
   const noteQuotes = await db.select().from(quotes).where(eq(quotes.noteId, noteId));
+  const noteTags = await db.select().from(tags).where(eq(tags.noteId, noteId));
 
   return c.json({
     ...note,
@@ -123,6 +234,7 @@ app.get("/:id", async (c) => {
     topics: noteTopics.map((t) => t.label),
     people: notePeopleRows.map((r) => r.person),
     quotes: noteQuotes,
+    tags: noteTags,
   });
 });
 
@@ -229,6 +341,38 @@ app.get("/search/:query", async (c) => {
     people: matchingPeople,
     commitments: matchingCommitments,
   });
+});
+
+// Add tag to note
+app.post("/:id/tags", async (c) => {
+  const userId = c.get("userId") as string;
+  const noteId = c.req.param("id");
+  const { label } = await c.req.json<{ label: string }>();
+
+  if (!label?.trim()) return c.json({ error: "Label required" }, 400);
+
+  // Verify note belongs to user
+  const [note] = await db
+    .select()
+    .from(notes)
+    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  if (!note) return c.json({ error: "Not found" }, 404);
+
+  const [tag] = await db
+    .insert(tags)
+    .values({ userId, noteId, label: label.trim() })
+    .returning();
+
+  return c.json(tag, 201);
+});
+
+// Remove tag from note
+app.delete("/:id/tags/:tagId", async (c) => {
+  const userId = c.get("userId") as string;
+  const tagId = c.req.param("tagId");
+
+  await db.delete(tags).where(and(eq(tags.id, tagId), eq(tags.userId, userId)));
+  return c.json({ ok: true });
 });
 
 export default app;

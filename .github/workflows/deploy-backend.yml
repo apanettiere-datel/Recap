@@ -1,11 +1,8 @@
-name: Deploy Backend
+name: Deploy Recap
 
 on:
   push:
     branches: [main]
-    paths:
-      - "backend/**"
-      - ".github/workflows/deploy-backend.yml"
   workflow_dispatch:
 
 jobs:
@@ -17,19 +14,19 @@ jobs:
         env:
           DB_URL: ${{ secrets.DATABASE_URL }}
           OAI_KEY: ${{ secrets.OPENAI_API_KEY }}
-          FB_PROJECT: ${{ secrets.FIREBASE_PROJECT_ID }}
+          CLERK_SK: ${{ secrets.CLERK_SECRET_KEY }}
           PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ubuntu
-          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
-          envs: DB_URL,OAI_KEY,FB_PROJECT,PG_PASS
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS
           script: |
             mkdir -p ~/recap/backend
             cat > ~/recap/backend/.env << EOF
             DATABASE_URL=${DB_URL}
             OPENAI_API_KEY=${OAI_KEY}
-            FIREBASE_PROJECT_ID=${FB_PROJECT}
+            CLERK_SECRET_KEY=${CLERK_SK}
             POSTGRES_PASSWORD=${PG_PASS}
             NODE_ENV=production
             PORT=3000
@@ -37,10 +34,13 @@ jobs:
 
       - name: Deploy application
         uses: appleboy/ssh-action@v1
+        env:
+          CLERK_PK: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ubuntu
-          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: CLERK_PK
           script_stop: true
           script: |
             # Install Docker if not present
@@ -50,6 +50,18 @@ jobs:
               newgrp docker
             fi
 
+            # Install Node.js if not present (for frontend build)
+            if ! command -v node &> /dev/null; then
+              curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+
+            # Install nginx if not present
+            if ! command -v nginx &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y nginx
+              sudo systemctl enable nginx
+            fi
+
             # Clone or pull latest code
             if [ ! -d ~/recap/.git ]; then
               git clone https://github.com/${{ github.repository }}.git ~/recap
@@ -57,23 +69,61 @@ jobs:
               cd ~/recap && git fetch origin && git reset --hard origin/main
             fi
 
-            cd ~/recap/backend
+            # Build frontend
+            cd ~/recap/web
+            npm ci
+            VITE_CLERK_PUBLISHABLE_KEY=${CLERK_PK} VITE_API_URL=https://api.personalrecap.com npx vite build
+            sudo rm -rf /var/www/personalrecap
+            sudo mkdir -p /var/www/personalrecap
+            sudo cp -r dist/* /var/www/personalrecap/
 
-            # Build and restart containers
+            # Build and restart backend containers
+            cd ~/recap/backend
             docker compose down || true
             docker compose up -d --build --remove-orphans
 
             # Run database migrations
-            docker compose exec -T api node -e "
-              import('drizzle-orm/node-postgres/migrator').then(m =>
-                m.migrate(require('./dist/services/db.js').db, { migrationsFolder: './drizzle' })
-              ).catch(() => process.exit(0))
-            " || true
+            sleep 5
+            for migration in ~/recap/backend/drizzle/0*.sql; do
+              docker compose exec -T db psql -U recap -d recap -f /dev/stdin < "$migration" 2>/dev/null || true
+            done
+
+            # Configure nginx
+            sudo tee /etc/nginx/sites-available/personalrecap > /dev/null << 'NGINX'
+            server {
+                listen 80;
+                server_name personalrecap.com www.personalrecap.com;
+
+                root /var/www/personalrecap;
+                index index.html;
+
+                location / {
+                    try_files $uri $uri/ /index.html;
+                }
+            }
+
+            server {
+                listen 80;
+                server_name api.personalrecap.com;
+
+                location / {
+                    proxy_pass http://127.0.0.1:3001;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    client_max_body_size 50M;
+                }
+            }
+            NGINX
+
+            sudo ln -sf /etc/nginx/sites-available/personalrecap /etc/nginx/sites-enabled/
+            sudo nginx -t && sudo systemctl reload nginx
 
             # Wait for health check
             echo "Waiting for API to start..."
             for i in $(seq 1 20); do
-              if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
                 echo "API is healthy!"
                 exit 0
               fi
