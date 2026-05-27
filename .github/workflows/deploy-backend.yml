@@ -9,41 +9,52 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Write env file to server
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.LIGHTSAIL_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync code to server
+        run: |
+          rsync -avz --delete \
+            --exclude node_modules \
+            --exclude .git \
+            --exclude 'backend/.env' \
+            --exclude uploads \
+            ./ ubuntu@${{ secrets.LIGHTSAIL_HOST }}:~/recap/
+
+      - name: Write env and deploy
         uses: appleboy/ssh-action@v1
         env:
           DB_URL: ${{ secrets.DATABASE_URL }}
           OAI_KEY: ${{ secrets.OPENAI_API_KEY }}
           CLERK_SK: ${{ secrets.CLERK_SECRET_KEY }}
           PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
+          CLERK_PK: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ubuntu
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS
+          envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS,CLERK_PK
+          command_timeout: 15m
           script: |
-            mkdir -p ~/recap/backend
-            cat > ~/recap/backend/.env <<EOF
+            set -e
+
+            # Write .env
+            cat > ~/recap/backend/.env <<ENVEOF
             DATABASE_URL=${DB_URL}
             OPENAI_API_KEY=${OAI_KEY}
             CLERK_SECRET_KEY=${CLERK_SK}
             POSTGRES_PASSWORD=${PG_PASS}
             NODE_ENV=production
             PORT=3000
-            EOF
+            ENVEOF
             sed -i 's/^[[:space:]]*//' ~/recap/backend/.env
-
-      - name: Deploy application
-        uses: appleboy/ssh-action@v1
-        env:
-          CLERK_PK: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
-        with:
-          host: ${{ secrets.LIGHTSAIL_HOST }}
-          username: ubuntu
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: CLERK_PK
-          script: |
-            set -e
 
             # Install Docker if not present
             if ! command -v docker &> /dev/null; then
@@ -61,17 +72,6 @@ jobs:
             if ! command -v nginx &> /dev/null; then
               sudo apt-get update && sudo apt-get install -y nginx
               sudo systemctl enable nginx
-            fi
-
-            # Clone or pull latest code
-            if [ ! -d ~/recap/.git ]; then
-              # Save .env if it exists, clone fresh, restore .env
-              [ -f ~/recap/backend/.env ] && cp ~/recap/backend/.env /tmp/recap-env-backup
-              rm -rf ~/recap
-              git clone https://github.com/${{ github.repository }}.git ~/recap
-              [ -f /tmp/recap-env-backup ] && mv /tmp/recap-env-backup ~/recap/backend/.env
-            else
-              cd ~/recap && git fetch origin && git reset --hard origin/main
             fi
 
             # Build frontend
