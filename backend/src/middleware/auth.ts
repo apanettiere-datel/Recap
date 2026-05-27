@@ -26,10 +26,12 @@ export async function authMiddleware(c: Context, next: Next) {
 
   try {
     const payload = await verifyToken(token, { secretKey: CLERK_SECRET });
+    console.log("[auth] verified sub:", payload.sub);
     c.set("firebaseUid", payload.sub);
     c.set("email", (payload as any).email || "");
     await next();
-  } catch {
+  } catch (e: any) {
+    console.log("[auth] verify failed:", e.message || e);
     return c.json({ error: "Invalid token" }, 401);
   }
 }

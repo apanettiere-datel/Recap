@@ -22,6 +22,13 @@ app.use("*", cors({
   allowHeaders: ["Authorization", "Content-Type"],
 }));
 
+// Request logging
+app.use("*", async (c, next) => {
+  const start = Date.now();
+  await next();
+  console.log(`[${c.req.method}] ${c.req.path} → ${c.res.status} (${Date.now() - start}ms)`);
+});
+
 // Health check (no auth)
 app.get("/health", (c) => c.json({ status: "ok", version: "1.0.0" }));
 
