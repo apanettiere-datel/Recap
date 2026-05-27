@@ -282,9 +282,17 @@ app.get("/:id/audio", async (c) => {
   try {
     const filePath = fileURLToPath(note.audioUrl);
     const data = await readFile(filePath);
-    const contentType = filePath.endsWith(".webm") ? "audio/webm" :
-                        filePath.endsWith(".ogg") ? "audio/ogg" :
-                        filePath.endsWith(".wav") ? "audio/wav" : "audio/mp4";
+
+    // Detect actual format from magic bytes, not file extension
+    let contentType = "audio/mp4";
+    if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) {
+      contentType = "audio/webm";
+    } else if (data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53) {
+      contentType = "audio/ogg";
+    } else if (data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46) {
+      contentType = "audio/wav";
+    }
+
     return new Response(data, {
       headers: {
         "Content-Type": contentType,

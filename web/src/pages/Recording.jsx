@@ -260,33 +260,33 @@ export default function Recording() {
 
   if (status === 'uploading') {
     return (
-      <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center">
+      <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center">
         <div className="w-12 h-12 border-3 border-blue-500 border-t-transparent rounded-full animate-spin mb-6" />
-        <p className="text-white text-lg font-semibold">Processing your recording...</p>
-        <p className="text-neutral-400 text-sm mt-2">This may take a moment</p>
+        <p className="text-neutral-900 dark:text-white text-lg font-semibold">Processing your recording...</p>
+        <p className="text-neutral-500 dark:text-neutral-400 text-sm mt-2">This may take a moment</p>
       </div>
     )
   }
 
   if (!mode) {
     return (
-      <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center px-6">
+      <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center px-6">
         <button
           type="button"
           onClick={() => navigate(-1)}
-          className="absolute top-6 left-6 text-neutral-400 hover:text-white text-sm font-medium transition-colors"
+          className="absolute top-6 left-6 text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white text-sm font-medium transition-colors"
         >
           Cancel
         </button>
 
-        <h1 className="text-2xl font-bold text-white mb-2 tracking-tight">New Recording</h1>
-        <p className="text-neutral-400 text-sm mb-10">What are you recording?</p>
+        <h1 className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 tracking-tight">New Recording</h1>
+        <p className="text-neutral-500 dark:text-neutral-400 text-sm mb-10">What are you recording?</p>
 
         <div className="flex flex-col gap-4 w-full max-w-xs">
           <button
             type="button"
             onClick={() => selectMode('voice')}
-            className="flex items-center gap-4 p-5 rounded-2xl bg-neutral-900 border border-neutral-800 hover:border-neutral-600 transition-colors text-left"
+            className="flex items-center gap-4 p-5 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-neutral-400 dark:hover:border-neutral-600 transition-colors text-left"
           >
             <div className="w-12 h-12 rounded-full bg-red-500/15 flex items-center justify-center flex-shrink-0">
               <svg className="w-6 h-6 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -294,15 +294,15 @@ export default function Recording() {
               </svg>
             </div>
             <div>
-              <p className="text-base font-semibold text-white">Voice Note</p>
-              <p className="text-sm text-neutral-400 mt-0.5">Record from your microphone</p>
+              <p className="text-base font-semibold text-neutral-900 dark:text-white">Voice Note</p>
+              <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">Record from your microphone</p>
             </div>
           </button>
 
           <button
             type="button"
             onClick={() => selectMode('meeting')}
-            className="flex items-center gap-4 p-5 rounded-2xl bg-neutral-900 border border-neutral-800 hover:border-neutral-600 transition-colors text-left"
+            className="flex items-center gap-4 p-5 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-neutral-400 dark:hover:border-neutral-600 transition-colors text-left"
           >
             <div className="w-12 h-12 rounded-full bg-blue-500/15 flex items-center justify-center flex-shrink-0">
               <svg className="w-6 h-6 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -310,13 +310,13 @@ export default function Recording() {
               </svg>
             </div>
             <div>
-              <p className="text-base font-semibold text-white">Meeting</p>
-              <p className="text-sm text-neutral-400 mt-0.5">Capture mic + browser tab audio</p>
+              <p className="text-base font-semibold text-neutral-900 dark:text-white">Meeting</p>
+              <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">Capture mic + browser tab audio</p>
             </div>
           </button>
         </div>
 
-        <p className="text-neutral-600 text-xs mt-8 text-center max-w-xs">
+        <p className="text-neutral-400 dark:text-neutral-600 text-xs mt-8 text-center max-w-xs">
           Meeting mode captures audio from a shared browser tab (Zoom, Teams, Meet) plus your microphone.
           Works in Chrome and Edge.
         </p>
@@ -325,12 +325,12 @@ export default function Recording() {
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center">
+    <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center">
       {/* Cancel */}
       <button
         type="button"
         onClick={cancelRecording}
-        className="absolute top-6 left-6 text-neutral-400 hover:text-white text-sm font-medium transition-colors"
+        className="absolute top-6 left-6 text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white text-sm font-medium transition-colors"
       >
         Cancel
       </button>
@@ -339,8 +339,8 @@ export default function Recording() {
       <div className="absolute top-6 right-6">
         <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
           mode === 'meeting'
-            ? 'bg-blue-500/15 text-blue-400'
-            : 'bg-red-500/15 text-red-400'
+            ? 'bg-blue-500/15 text-blue-500 dark:text-blue-400'
+            : 'bg-red-500/15 text-red-500 dark:text-red-400'
         }`}>
           {mode === 'meeting' ? (
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -363,7 +363,7 @@ export default function Recording() {
 
       {/* Timer */}
       <div className="mb-8">
-        <p className="text-5xl font-light text-white tabular-nums tracking-wide">
+        <p className="text-5xl font-light text-neutral-900 dark:text-white tabular-nums tracking-wide">
           {formatTime(elapsed)}
         </p>
         {status === 'recording' && (
