@@ -94,6 +94,9 @@ jobs:
               docker compose -f docker-compose.yml exec -T db psql -U recap -d recap -f /dev/stdin < "$migration" 2>/dev/null || true
             done
 
+            # Ensure enum values are up to date
+            docker compose -f docker-compose.yml exec -T db psql -U recap -d recap -c "ALTER TYPE insight_type ADD VALUE IF NOT EXISTS 'activity_summary';" 2>/dev/null || true
+
             # Configure nginx
             sudo tee /etc/nginx/sites-available/personalrecap > /dev/null <<'NGINX'
             server {

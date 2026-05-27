@@ -142,9 +142,11 @@ async function enrichPeopleFromEntities(userId: string, entities: Entity[], pers
     }
   }
 
-  // Attach organization info to people who were mentioned alongside that org
   for (const org of orgs) {
     const orgName = org.text.trim();
+    if (!orgName) continue;
+
+    // Attach org info to mentioned people
     if (personNames.length > 0) {
       for (const name of personNames) {
         const person = await findOrCreatePerson(userId, name);
@@ -152,6 +154,21 @@ async function enrichPeopleFromEntities(userId: string, entities: Entity[], pers
           await db.update(people).set({ organization: orgName }).where(eq(people.id, person.id));
         }
       }
+    }
+
+    // Create org as a trackable entity
+    const existing = await db
+      .select()
+      .from(people)
+      .where(and(eq(people.userId, userId), eq(people.name, orgName)))
+      .limit(1);
+    if (existing.length === 0) {
+      await db.insert(people).values({
+        userId,
+        name: orgName,
+        relationship: "organization",
+        organization: orgName,
+      });
     }
   }
 }

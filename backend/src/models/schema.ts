@@ -11,6 +11,7 @@ export const insightTypeEnum = pgEnum("insight_type", [
   "sentiment_shift",
   "avoidance_pattern",
   "accountability",
+  "activity_summary",
 ]);
 export const insightPriorityEnum = pgEnum("insight_priority", ["low", "medium", "high", "urgent"]);
 

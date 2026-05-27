@@ -59,7 +59,8 @@ export default function NoteDetail() {
 
   useEffect(() => {
     let url = null
-    authFetch(`/api/notes/${id}/audio`)
+    const apiBase = import.meta.env.VITE_API_URL || ''
+    authFetch(`${apiBase}/api/notes/${id}/audio`)
       .then(r => { if (r.ok) return r.blob(); throw new Error('no audio') })
       .then(blob => { url = URL.createObjectURL(blob); setAudioUrl(url) })
       .catch(() => {})

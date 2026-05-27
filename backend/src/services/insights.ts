@@ -52,16 +52,16 @@ export async function generateInsights(userId: string) {
     });
   }
 
-  // Upcoming deadlines (within 3 days)
-  const threeDaysFromNow = new Date(now.getTime() + 3 * 86400000);
+  // Upcoming deadlines (within 7 days)
+  const sevenDaysFromNow = new Date(now.getTime() + 7 * 86400000);
   for (const c of allCommitments) {
     if (c.status !== "open" || !c.dueDate) continue;
-    if (c.dueDate < now || c.dueDate > threeDaysFromNow) continue;
+    if (c.dueDate < now || c.dueDate > sevenDaysFromNow) continue;
     const daysLeft = Math.floor((c.dueDate.getTime() - now.getTime()) / 86400000);
     generated.push({
       userId,
       type: "accountability",
-      priority: daysLeft <= 1 ? "high" : "medium",
+      priority: daysLeft <= 1 ? "high" : daysLeft <= 3 ? "medium" : "low",
       title: `Deadline ${daysLeft === 0 ? "today" : `in ${daysLeft} day${daysLeft === 1 ? "" : "s"}`}`,
       body: `"${c.description}" — ${c.owner === "me" ? "you own this" : "they own this"}.`,
       relatedPersonName: allPeople.find((p) => p.id === c.personId)?.name ?? null,
@@ -119,6 +119,33 @@ export async function generateInsights(userId: string) {
       title: "Forgotten commitment?",
       body: `"${c.description}" was mentioned ${daysSince} days ago with no deadline. Still relevant?`,
       relatedPersonName: allPeople.find((p) => p.id === c.personId)?.name ?? null,
+    });
+  }
+
+  // Activity summary when there's recent activity
+  if (recentNotes.length > 0) {
+    const uniquePeopleInNotes = new Set<string>();
+    for (const n of recentNotes) {
+      const linked = await db
+        .select()
+        .from(notePeople)
+        .innerJoin(people, eq(notePeople.personId, people.id))
+        .where(eq(notePeople.noteId, n.id));
+      linked.forEach((r) => uniquePeopleInNotes.add(r.people.name));
+    }
+    const openCount = allCommitments.filter((c) => c.status === "open").length;
+    const topTopics = Object.entries(topicCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+    generated.push({
+      userId,
+      type: "activity_summary",
+      priority: "low",
+      title: `${recentNotes.length} conversation${recentNotes.length === 1 ? "" : "s"} in the last 4 weeks`,
+      body: [
+        uniquePeopleInNotes.size > 0 ? `You've talked with ${[...uniquePeopleInNotes].join(", ")}.` : null,
+        openCount > 0 ? `${openCount} open commitment${openCount === 1 ? "" : "s"} to track.` : null,
+        topTopics.length > 0 ? `Top topics: ${topTopics.map(([t]) => t).join(", ")}.` : null,
+      ].filter(Boolean).join(" "),
     });
   }
 
