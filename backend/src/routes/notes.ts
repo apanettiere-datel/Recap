@@ -22,9 +22,10 @@ app.post("/", async (c) => {
 
   if (!audio) return c.json({ error: "No audio file" }, 400);
 
-  // Save audio to local disk
+  // Save audio to local disk (preserve original format)
   await mkdir(UPLOADS_DIR, { recursive: true });
-  const filename = `${userId}_${Date.now()}.m4a`;
+  const ext = audio.name?.endsWith(".webm") ? "webm" : audio.name?.split(".").pop() || "webm";
+  const filename = `${userId}_${Date.now()}.${ext}`;
   const filePath = join(UPLOADS_DIR, filename);
   const buffer = Buffer.from(await audio.arrayBuffer());
   await writeFile(filePath, buffer);
@@ -281,9 +282,12 @@ app.get("/:id/audio", async (c) => {
   try {
     const filePath = fileURLToPath(note.audioUrl);
     const data = await readFile(filePath);
+    const contentType = filePath.endsWith(".webm") ? "audio/webm" :
+                        filePath.endsWith(".ogg") ? "audio/ogg" :
+                        filePath.endsWith(".wav") ? "audio/wav" : "audio/mp4";
     return new Response(data, {
       headers: {
-        "Content-Type": "audio/mp4",
+        "Content-Type": contentType,
         "Content-Length": data.byteLength.toString(),
         "Accept-Ranges": "bytes",
       },

@@ -1,8 +1,9 @@
 import OpenAI from "openai";
 import { readFile } from "node:fs/promises";
 import { db } from "./db.js";
-import { notes, commitments, topics, people, notePeople, quotes } from "../models/schema.js";
+import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
 import { eq, and } from "drizzle-orm";
+import { generateInsights } from "./insights.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -24,6 +25,7 @@ interface AnalysisResult {
   }[];
   people: string[];
   topics: string[];
+  tags: string[];
   quotes: {
     text: string;
     speaker: string;
@@ -78,6 +80,10 @@ export async function processNote(noteId: string, userId: string) {
       await db.insert(topics).values({ noteId, label });
     }
 
+    for (const label of (analysis.tags || [])) {
+      await db.insert(tags).values({ userId, noteId, label });
+    }
+
     for (const q of analysis.quotes) {
       const person = await findOrCreatePerson(userId, q.speaker);
       await db.insert(quotes).values({
@@ -102,6 +108,9 @@ export async function processNote(noteId: string, userId: string) {
 
     // Enrich people with extracted entities (phone, email, org)
     await enrichPeopleFromEntities(userId, analysis.entities, analysis.people);
+
+    // Auto-generate insights after processing
+    generateInsights(userId).catch((e) => console.error("[processNote] insights generation failed:", e));
 
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -133,36 +142,36 @@ async function enrichPeopleFromEntities(userId: string, entities: Entity[], pers
     }
   }
 
-  // Create org entries as people too (for CRM tracking)
+  // Attach organization info to people who were mentioned alongside that org
   for (const org of orgs) {
-    const existing = await db
-      .select()
-      .from(people)
-      .where(and(eq(people.userId, userId), eq(people.name, org.text.trim())))
-      .limit(1);
-    if (existing.length === 0) {
-      await db.insert(people).values({
-        userId,
-        name: org.text.trim(),
-        relationship: "organization",
-        organization: org.text.trim(),
-      });
+    const orgName = org.text.trim();
+    if (personNames.length > 0) {
+      for (const name of personNames) {
+        const person = await findOrCreatePerson(userId, name);
+        if (person && !person.organization) {
+          await db.update(people).set({ organization: orgName }).where(eq(people.id, person.id));
+        }
+      }
     }
   }
 }
 
 async function transcribeAudio(audioUrl: string): Promise<string> {
   let audioBuffer: ArrayBuffer;
+  let filename = "audio.webm";
 
   if (audioUrl.startsWith("file://")) {
     const filePath = audioUrl.slice(7);
     audioBuffer = (await readFile(filePath)).buffer as ArrayBuffer;
+    filename = filePath.split("/").pop() || filename;
   } else {
     const response = await fetch(audioUrl);
     audioBuffer = await response.arrayBuffer();
   }
 
-  const file = new File([audioBuffer], "audio.m4a", { type: "audio/m4a" });
+  const ext = filename.split(".").pop() || "webm";
+  const mimeType = ext === "webm" ? "audio/webm" : ext === "ogg" ? "audio/ogg" : "audio/mp4";
+  const file = new File([audioBuffer], filename, { type: mimeType });
 
   const transcription = await openai.audio.transcriptions.create({
     model: "whisper-1",
@@ -192,7 +201,10 @@ async function analyzeTranscript(
 ${knownPeople.map(p => `- "${p.name}"${p.relationship ? ` (${p.relationship})` : ""}${p.keywords.length > 0 ? ` — keywords/aliases: ${p.keywords.join(", ")}` : ""}`).join("\n")}\n`
     : "";
 
+  const today = new Date().toISOString().split("T")[0];
+
   const prompt = `Analyze this conversation transcript. Mode: ${mode}.
+TODAY'S DATE: ${today}
 ${modeInstructions[mode] || modeInstructions.general}
 ${knownPeopleContext}
 Return JSON with this exact structure:
@@ -203,8 +215,9 @@ Return JSON with this exact structure:
   "commitments": [
     { "description": "What was promised", "owner": "me or them", "due_date": "ISO date or null", "person_name": "who this commitment involves or null" }
   ],
-  "people": ["Every person or entity name mentioned — names, nicknames, titles, companies"],
+  "people": ["Only actual PERSON names mentioned"],
   "topics": ["Key topics discussed, max 5, be specific"],
+  "tags": ["3-5 short labels for categorizing this note, e.g. 'sales', 'follow-up', 'planning', 'hiring'"],
   "quotes": [
     { "text": "Notable or important quote", "speaker": "Person name" }
   ],
@@ -212,6 +225,15 @@ Return JSON with this exact structure:
     { "type": "PERSON|ORGANIZATION|PHONE|DATE|EMAIL|LOCATION", "text": "the entity", "context": "brief context of how it was mentioned" }
   ]
 }
+
+## DATE HANDLING (CRITICAL)
+Today's date is ${today}. When someone says a relative date, convert it to an absolute ISO date:
+- "next week" → the Monday of next week from ${today}
+- "tomorrow" → the day after ${today}
+- "end of month" → the last day of the current month
+- "next Friday" → the next upcoming Friday from ${today}
+- If a date is ambiguous or too vague to resolve, use null instead of guessing
+- NEVER return dates in the past unless the speaker explicitly mentioned a past date
 
 ## ENTITY DETECTION (MANDATORY — never return empty)
 You MUST identify ALL entities spoken in the transcript:
@@ -222,11 +244,10 @@ You MUST identify ALL entities spoken in the transcript:
 - DATE: Any dates, times, or scheduling references ("tomorrow at 12:30", "next Tuesday")
 - LOCATION: Places mentioned ("Oregon", "the office")
 
-## PEOPLE DETECTION (CRITICAL)
-Include ALL of these in the "people" array:
-- Anyone addressed by name, nickname, or title (e.g., "mom", "Gary", "Dr. Smith")
-- Anyone referred to in third person ("my boss", "Sarah from accounting")
-- Organizations discussed as entities you'd want to track ("Datel Software Solutions")
+## PEOPLE vs ORGANIZATIONS (CRITICAL)
+The "people" array must ONLY contain actual human beings — never companies, brands, or services.
+- People: "Gary", "mom", "Dr. Smith", "Sarah from accounting"
+- NOT people (put these ONLY in entities with type ORGANIZATION): "Rev.io", "DataGate", "Datel Software Solutions", "Google"
 - If someone is called "mom", "dad", "bro" etc., use that as their name unless you can match to a known person above
 
 ## RULES
@@ -257,6 +278,7 @@ ${transcript}`;
   const result = JSON.parse(response.choices[0].message.content!) as AnalysisResult;
   result.entities = result.entities || [];
   result.people = result.people || [];
+  result.tags = result.tags || [];
   return result;
 }
 

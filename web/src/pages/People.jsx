@@ -217,7 +217,7 @@ export default function People() {
           </form>
         )}
 
-        {!people || people.length === 0 ? (
+        {!people || people.filter(p => p.relationship !== 'organization').length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-center">
             <div className="w-16 h-16 rounded-full bg-neutral-200 dark:bg-neutral-800 flex items-center justify-center mb-4">
               <svg className="w-8 h-8 text-neutral-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -231,7 +231,7 @@ export default function People() {
           </div>
         ) : (
           <div className="bg-white dark:bg-neutral-900 rounded-2xl border border-neutral-200 dark:border-neutral-800 divide-y divide-neutral-100 dark:divide-neutral-800">
-            {people.map((person) => (
+            {people.filter(p => p.relationship !== 'organization').map((person) => (
               <button
                 key={person.id}
                 type="button"

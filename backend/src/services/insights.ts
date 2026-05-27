@@ -160,16 +160,18 @@ export async function generateWeeklyReport(userId: string) {
   );
 
   // Build AI prompt
+  const fmtDate = (d: Date) => d.toISOString().split("T")[0];
+
   const notesSummary = weekNotes
-    .map((n) => `- ${n.recordedAt.toLocaleDateString()}: ${n.summary}`)
+    .map((n) => `- ${fmtDate(n.recordedAt)}: ${n.summary}`)
     .join("\n");
 
   const overdueText = overdue
-    .map((c) => `- ${c.description} (${c.owner}, due ${c.dueDate?.toLocaleDateString()})`)
+    .map((c) => `- ${c.description} (${c.owner}, due ${c.dueDate ? fmtDate(c.dueDate) : "unknown"})`)
     .join("\n");
 
   const decayingText = decaying
-    .map((p) => `- ${p.name} (last: ${p.lastContactDate?.toLocaleDateString()})`)
+    .map((p) => `- ${p.name} (last: ${p.lastContactDate ? fmtDate(p.lastContactDate) : "unknown"})`)
     .join("\n");
 
   const response = await openai.chat.completions.create({
@@ -183,7 +185,7 @@ export async function generateWeeklyReport(userId: string) {
       },
       {
         role: "user",
-        content: `Generate a weekly report. Be brutally honest and specific — use names and dates.
+        content: `Generate a weekly report. Today is ${fmtDate(now)}. The reporting period is ${fmtDate(weekAgo)} to ${fmtDate(now)}. Be brutally honest and specific — use names and dates.
 
 Return JSON:
 {

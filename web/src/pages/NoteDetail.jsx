@@ -53,6 +53,8 @@ export default function NoteDetail() {
   const [showShare, setShowShare] = useState(false)
   const [tagInput, setTagInput] = useState('')
   const [showTagInput, setShowTagInput] = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
   const authFetch = useAuthFetch()
 
   useEffect(() => {
@@ -75,6 +77,15 @@ export default function NoteDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['note', id] })
       queryClient.invalidateQueries({ queryKey: ['commitments'] })
+    },
+  })
+
+  const updateTitle = useMutation({
+    mutationFn: (title) => api.patch(`/notes/${id}`, { title }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['note', id] })
+      queryClient.invalidateQueries({ queryKey: ['notes'] })
+      setEditingTitle(false)
     },
   })
 
@@ -182,9 +193,32 @@ export default function NoteDetail() {
 
       <div className="max-w-2xl mx-auto px-4 pt-6">
         {/* Title & meta */}
-        <h1 className="text-2xl font-bold text-neutral-900 dark:text-white mb-2">
-          {note.title || 'Untitled Note'}
-        </h1>
+        {editingTitle ? (
+          <input
+            type="text"
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={() => {
+              const t = titleDraft.trim()
+              if (t && t !== note.title) updateTitle.mutate(t)
+              else setEditingTitle(false)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.target.blur() }
+              if (e.key === 'Escape') { setEditingTitle(false) }
+            }}
+            className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 w-full bg-transparent border-b-2 border-blue-500 outline-none"
+            autoFocus
+          />
+        ) : (
+          <h1
+            className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 cursor-pointer hover:text-blue-500 transition-colors"
+            onClick={() => { setTitleDraft(note.title || ''); setEditingTitle(true) }}
+            title="Click to edit title"
+          >
+            {note.title || 'Untitled Note'}
+          </h1>
+        )}
         <div className="flex items-center gap-3 flex-wrap mb-6">
           <span className="text-sm text-neutral-500 dark:text-neutral-400">
             {formatFullDate(note.recordedAt)}

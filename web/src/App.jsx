@@ -21,6 +21,7 @@ const DailyBriefing = React.lazy(() => import('./pages/DailyBriefing'))
 const Briefing = React.lazy(() => import('./pages/Briefing'))
 const Commitments = React.lazy(() => import('./pages/Commitments'))
 const Archive = React.lazy(() => import('./pages/Archive'))
+const Entities = React.lazy(() => import('./pages/Entities'))
 
 function Loading() {
   return (
@@ -49,6 +50,7 @@ function AppRoutes() {
           <Route path="briefing/:personId" element={<Briefing />} />
           <Route path="commitments" element={<Commitments />} />
           <Route path="archive" element={<Archive />} />
+          <Route path="entities" element={<Entities />} />
         </Route>
         {CLERK_KEY && (
           <>

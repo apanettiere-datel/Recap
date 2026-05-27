@@ -7,6 +7,7 @@ const CLERK_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
 const navItems = [
   { to: '/', label: 'Feed', icon: FeedIcon },
   { to: '/people', label: 'People', icon: PeopleIcon },
+  { to: '/entities', label: 'Entities', icon: EntitiesIcon },
   { to: '/insights', label: 'Insights', icon: InsightsIcon },
   { to: '/report', label: 'Report', icon: ReportIcon },
   { to: '/settings', label: 'Settings', icon: SettingsIcon },
@@ -140,6 +141,14 @@ function ReportIcon({ size = 24 }) {
       <line x1="8" y1="13" x2="16" y2="13" />
       <line x1="8" y1="17" x2="16" y2="17" />
       <line x1="8" y1="9" x2="10" y2="9" />
+    </svg>
+  )
+}
+
+function EntitiesIcon({ size = 24 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h1.5m-1.5 3h1.5m-1.5 3h1.5m3-6H15m-1.5 3H15m-1.5 3H15M9 21v-3.375c0-.621.504-1.125 1.125-1.125h3.75c.621 0 1.125.504 1.125 1.125V21" />
     </svg>
   )
 }

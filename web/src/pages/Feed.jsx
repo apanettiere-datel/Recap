@@ -292,7 +292,7 @@ export default function Feed() {
       </div>
 
       {/* Person filter */}
-      {people?.length > 0 && (
+      {people?.filter(p => p.relationship !== 'organization').length > 0 && (
         <div className="max-w-2xl mx-auto px-4 pt-3 flex gap-2 overflow-x-auto">
           <button
             type="button"
@@ -305,7 +305,7 @@ export default function Feed() {
           >
             All People
           </button>
-          {people.map((person) => (
+          {people.filter(p => p.relationship !== 'organization').map((person) => (
             <button
               key={person.id}
               type="button"
