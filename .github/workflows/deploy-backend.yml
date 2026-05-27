@@ -65,7 +65,11 @@ jobs:
 
             # Clone or pull latest code
             if [ ! -d ~/recap/.git ]; then
+              # Save .env if it exists, clone fresh, restore .env
+              [ -f ~/recap/backend/.env ] && cp ~/recap/backend/.env /tmp/recap-env-backup
+              rm -rf ~/recap
               git clone https://github.com/${{ github.repository }}.git ~/recap
+              [ -f /tmp/recap-env-backup ] && mv /tmp/recap-env-backup ~/recap/backend/.env
             else
               cd ~/recap && git fetch origin && git reset --hard origin/main
             fi
