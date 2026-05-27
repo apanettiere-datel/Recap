@@ -275,13 +275,13 @@ export default function NoteDetail() {
         )}
 
         {/* People */}
-        {note.people?.length > 0 && (
+        {note.people?.filter(p => p.relationship !== 'organization').length > 0 && (
           <div className="mb-6">
             <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
               People
             </h2>
             <div className="flex flex-wrap gap-2">
-              {note.people.map((person, i) => (
+              {note.people.filter(p => p.relationship !== 'organization').map((person, i) => (
                 <button
                   key={person.id || i}
                   type="button"
@@ -292,6 +292,30 @@ export default function NoteDetail() {
                     {getInitials(person.name)}
                   </div>
                   <span className="text-sm text-neutral-700 dark:text-neutral-300">{person.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Entities */}
+        {note.people?.filter(p => p.relationship === 'organization').length > 0 && (
+          <div className="mb-6">
+            <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+              Entities
+            </h2>
+            <div className="flex flex-wrap gap-2">
+              {note.people.filter(p => p.relationship === 'organization').map((entity, i) => (
+                <button
+                  key={entity.id || i}
+                  type="button"
+                  onClick={() => entity.id && navigate(`/person/${entity.id}`)}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-purple-500 transition-colors"
+                >
+                  <div className={`w-6 h-6 rounded-xl flex items-center justify-center text-[10px] font-bold text-white bg-purple-500`}>
+                    {getInitials(entity.name)}
+                  </div>
+                  <span className="text-sm text-neutral-700 dark:text-neutral-300">{entity.name}</span>
                 </button>
               ))}
             </div>
