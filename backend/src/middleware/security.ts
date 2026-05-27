@@ -26,15 +26,28 @@ export async function rateLimiter(c: Context, next: Next) {
 
 export async function resolveUser(c: Context, next: Next) {
   const firebaseUid = c.get("firebaseUid") as string;
+  const email = c.get("email") as string | undefined;
 
-  const [user] = await db
+  let [user] = await db
     .select()
     .from(users)
     .where(eq(users.firebaseUid, firebaseUid))
     .limit(1);
 
   if (!user) {
-    return c.json({ error: "User not found. Call POST /users/sync first." }, 404);
+    [user] = await db
+      .insert(users)
+      .values({ firebaseUid, email })
+      .onConflictDoNothing()
+      .returning();
+    if (!user) {
+      [user] = await db
+        .select()
+        .from(users)
+        .where(eq(users.firebaseUid, firebaseUid))
+        .limit(1);
+    }
+    console.log("[resolveUser] auto-created user:", firebaseUid);
   }
 
   c.set("userId", user.id);
