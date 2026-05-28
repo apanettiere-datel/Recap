@@ -11,8 +11,17 @@ import { usePreferences } from '../stores/preferences';
 import { useUploadNote } from '../hooks/useNotes';
 import { MicFill, StopFill, Xmark } from '../components/icons';
 
-const fmt = (n: number) =>
-  `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}`;
+const MAX_RECORDING_SECONDS = 2 * 60 * 60; // 2 hours
+
+const fmt = (n: number) => {
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+};
 
 const NUM_BARS = 7;
 
@@ -114,6 +123,7 @@ export default function RecordingScreen() {
           type: 'audio/m4a',
         } as any);
         formData.append('mode', mode);
+        formData.append('duration', String(seconds));
         await uploadNote.mutateAsync(formData);
       }
 
@@ -136,6 +146,13 @@ export default function RecordingScreen() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (seconds >= MAX_RECORDING_SECONDS && state === 'recording') {
+      Alert.alert('Recording Limit', 'Maximum recording length (2 hours) reached. Your recording is being saved and processed.');
+      stopRecording();
+    }
+  }, [seconds, state, stopRecording]);
 
   const handleCancel = async () => {
     clearInterval(timer.current);

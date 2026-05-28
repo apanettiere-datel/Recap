@@ -3,9 +3,15 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useApi } from '@/lib/api'
 
+const MAX_RECORDING_SECONDS = 2 * 60 * 60 // 2 hours
+
 function formatTime(seconds) {
-  const m = Math.floor(seconds / 60)
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
   const s = seconds % 60
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  }
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
 
@@ -239,6 +245,12 @@ export default function Recording() {
     if (timerRef.current) clearInterval(timerRef.current)
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
   }, [cleanup, uploadMutation])
+
+  useEffect(() => {
+    if (elapsed >= MAX_RECORDING_SECONDS && status === 'recording') {
+      stopRecording()
+    }
+  }, [elapsed, status, stopRecording])
 
   const cancelRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current

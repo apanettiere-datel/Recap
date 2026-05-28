@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { serve } from "@hono/node-server";
 import { authMiddleware } from "./middleware/auth.js";
 import { rateLimiter, resolveUser, validateContentLength, errorHandler } from "./middleware/security.js";
@@ -50,8 +51,9 @@ app.use("/api/insights", resolveUser);
 app.use("/api/insights/*", resolveUser);
 app.use("/api/briefing/*", resolveUser);
 
-// Audio upload limit: 50MB
-app.use("/api/notes", validateContentLength(50 * 1024 * 1024));
+// Audio upload limit: 250MB (supports recordings up to ~2 hours)
+app.use("/api/notes", validateContentLength(250 * 1024 * 1024));
+app.use("/api/notes", bodyLimit({ maxSize: 250 * 1024 * 1024 }));
 
 // Routes
 app.route("/api/notes", notesRoutes);
