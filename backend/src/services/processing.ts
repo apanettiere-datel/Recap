@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { readFile, writeFile, mkdtemp, rm, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm, stat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
@@ -238,31 +238,24 @@ async function transcribeChunked(filePath: string, filename: string): Promise<Tr
   const chunkDir = await mkdtemp(join(tmpdir(), "recap-chunks-"));
 
   try {
-    const { stdout: durationStr } = await execFileAsync("ffprobe", [
-      "-v", "quiet",
-      "-show_entries", "format=duration",
-      "-of", "csv=p=0",
-      filePath,
+    const chunkPattern = join(chunkDir, `chunk_%03d.${ext}`);
+    await execFileAsync("ffmpeg", [
+      "-i", filePath,
+      "-f", "segment",
+      "-segment_time", String(CHUNK_DURATION_SECS),
+      "-c", "copy",
+      "-reset_timestamps", "1",
+      chunkPattern,
     ]);
-    const totalDuration = parseFloat(durationStr.trim());
 
-    if (isNaN(totalDuration) || totalDuration <= 0) {
-      throw new Error("Could not determine audio duration");
-    }
+    const files = await readdir(chunkDir);
+    const chunkPaths = files
+      .filter(f => f.startsWith("chunk_"))
+      .sort()
+      .map(f => join(chunkDir, f));
 
-    const chunkPaths: string[] = [];
-    for (let start = 0; start < totalDuration; start += CHUNK_DURATION_SECS) {
-      const chunkIndex = chunkPaths.length;
-      const chunkPath = join(chunkDir, `chunk_${String(chunkIndex).padStart(3, "0")}.${ext}`);
-      await execFileAsync("ffmpeg", [
-        "-i", filePath,
-        "-ss", String(start),
-        "-t", String(CHUNK_DURATION_SECS),
-        "-c", "copy",
-        "-y",
-        chunkPath,
-      ]);
-      chunkPaths.push(chunkPath);
+    if (chunkPaths.length === 0) {
+      throw new Error("ffmpeg produced no output chunks");
     }
 
     console.log(`[transcribe] Split into ${chunkPaths.length} chunks, transcribing...`);
