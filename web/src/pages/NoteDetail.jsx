@@ -121,6 +121,7 @@ export default function NoteDetail() {
   const reprocessMutation = useMutation({
     mutationFn: () => api.post(`/notes/${id}/reprocess`, {}),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['note', id] }),
+    onError: (err) => console.error('[reprocess] failed:', err),
   })
 
   const handleAddTag = () => {
@@ -200,7 +201,7 @@ export default function NoteDetail() {
 
       <div className="max-w-2xl mx-auto px-4 pt-6">
         {/* Processing indicator */}
-        {note.isProcessing && (
+        {(note.isProcessing || reprocessMutation.isPending) && (
           <div className="mb-6 flex items-center gap-3 px-4 py-3 rounded-2xl bg-blue-500/10 border border-blue-500/20">
             <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
             <div>
@@ -210,7 +211,7 @@ export default function NoteDetail() {
           </div>
         )}
 
-        {note.processingError && (
+        {note.processingError && !note.isProcessing && !reprocessMutation.isPending && (
           <div className="mb-6 px-4 py-3 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-start justify-between gap-3">
             <div>
               <p className="text-sm font-medium text-red-600 dark:text-red-400">Processing failed</p>
