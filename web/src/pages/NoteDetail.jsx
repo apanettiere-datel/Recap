@@ -119,7 +119,7 @@ export default function NoteDetail() {
   })
 
   const reprocessMutation = useMutation({
-    mutationFn: () => api.post(`/notes/${id}/reprocess`),
+    mutationFn: () => api.post(`/notes/${id}/reprocess`, {}),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['note', id] }),
   })
 
