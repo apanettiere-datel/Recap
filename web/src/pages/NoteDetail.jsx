@@ -118,6 +118,11 @@ export default function NoteDetail() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['note', id] }),
   })
 
+  const reprocessMutation = useMutation({
+    mutationFn: () => api.post(`/notes/${id}/reprocess`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['note', id] }),
+  })
+
   const handleAddTag = () => {
     const label = tagInput.trim()
     if (!label) return
@@ -206,9 +211,19 @@ export default function NoteDetail() {
         )}
 
         {note.processingError && (
-          <div className="mb-6 px-4 py-3 rounded-2xl bg-red-500/10 border border-red-500/20">
-            <p className="text-sm font-medium text-red-600 dark:text-red-400">Processing failed</p>
-            <p className="text-xs text-red-500/70 mt-0.5">{note.processingError}</p>
+          <div className="mb-6 px-4 py-3 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-red-600 dark:text-red-400">Processing failed</p>
+              <p className="text-xs text-red-500/70 mt-0.5">{note.processingError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => reprocessMutation.mutate()}
+              disabled={reprocessMutation.isPending}
+              className="flex-shrink-0 px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-500/20 text-red-600 dark:text-red-400 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+            >
+              {reprocessMutation.isPending ? 'Retrying...' : 'Retry'}
+            </button>
           </div>
         )}
 

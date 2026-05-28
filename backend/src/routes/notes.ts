@@ -306,6 +306,29 @@ app.get("/:id/audio", async (c) => {
   }
 });
 
+// Reprocess a failed note
+app.post("/:id/reprocess", async (c) => {
+  const userId = c.get("userId") as string;
+  const noteId = c.req.param("id");
+
+  const [note] = await db
+    .select()
+    .from(notes)
+    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+
+  if (!note) return c.json({ error: "Not found" }, 404);
+  if (!note.audioUrl) return c.json({ error: "No audio to process" }, 400);
+
+  await db
+    .update(notes)
+    .set({ isProcessing: true, processingError: null })
+    .where(eq(notes.id, noteId));
+
+  processNote(noteId, userId).catch(console.error);
+
+  return c.json({ id: noteId, status: "processing" });
+});
+
 // Delete note
 app.delete("/:id", async (c) => {
   const userId = c.get("userId") as string;
