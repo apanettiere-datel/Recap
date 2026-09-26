@@ -5,7 +5,8 @@ import { useApi } from '@/lib/api'
 import { parseTerms } from '@/lib/searchTerms'
 import { Highlight } from '@/lib/highlight'
 import NoteCard, { NoteCardSkeleton } from '@/components/NoteCard'
-import { getInitials, colorForName } from '@/lib/format'
+import { getInitials, colorForName, formatRelativeDate } from '@/lib/format'
+import { formatTimestamp } from '@/lib/useNoteAudio'
 
 const PAGE_SIZE = 20
 const RECENT_KEY = 'recap-recent-searches'
@@ -94,7 +95,7 @@ export default function Search() {
   const search = useInfiniteQuery({
     queryKey: ['search', q, personId, from, includeArchived],
     queryFn: ({ pageParam = 0, signal }) => {
-      const sp = new URLSearchParams({ q, limit: String(PAGE_SIZE), offset: String(pageParam) })
+      const sp = new URLSearchParams({ q, limit: String(PAGE_SIZE), offset: String(pageParam), semantic: '1' })
       if (personId) sp.set('personId', personId)
       if (from) sp.set('from', from)
       if (includeArchived) sp.set('archived', 'include')
@@ -110,6 +111,7 @@ export default function Search() {
   })
 
   const first = search.data?.pages?.[0]
+  const related = first?.related ?? []
   const notes = search.data?.pages?.flatMap((p) => p.notes || []) ?? []
   const matchedPeople = first?.people ?? []
   const matchedCommitments = first?.commitments ?? []
@@ -134,7 +136,7 @@ export default function Search() {
   const hasFilters = personId || range || includeArchived
   const showInitial = !q
   const loading = q && search.isLoading
-  const noResults = q && !search.isLoading && !search.isError && first && total === 0 && matchedPeople.length === 0 && matchedCommitments.length === 0
+  const noResults = q && !search.isLoading && !search.isError && first && total === 0 && matchedPeople.length === 0 && matchedCommitments.length === 0 && related.length === 0
 
   return (
     <div className="min-h-full pb-8">
@@ -339,6 +341,44 @@ export default function Search() {
                 </button>
               </div>
             )}
+          </section>
+        )}
+
+        {q && !loading && related.length > 0 && (
+          <section className="mt-8">
+            <div className="mb-2">
+              <h2 className="section-label">{notes.length ? 'Also related' : 'Related by meaning'}</h2>
+              <p className="text-xs text-neutral-400 mt-0.5">Conversations about the same thing, even if they use different words</p>
+            </div>
+            <div className="flex flex-col gap-3">
+              {related.map((n) => (
+                <div
+                  key={n.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openNote(n.id, n.start ?? undefined)}
+                  onKeyDown={(e) => e.key === 'Enter' && openNote(n.id, n.start ?? undefined)}
+                  className="bg-white dark:bg-neutral-900 rounded-2xl p-4 border border-neutral-200 dark:border-neutral-800 hover:shadow-md transition cursor-pointer"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 className="text-[15px] font-semibold text-neutral-900 dark:text-white line-clamp-1">{n.title || 'Untitled'}</h3>
+                    <span className="text-xs text-neutral-400 shrink-0">{formatRelativeDate(n.recordedAt)}</span>
+                  </div>
+                  {n.passage ? (
+                    <p className="mt-1.5 text-[13px] text-neutral-600 dark:text-neutral-400 line-clamp-2 leading-relaxed">
+                      {n.start != null && (
+                        <span className="inline-flex items-center gap-1 mr-1.5 text-xs font-medium tabular-nums text-blue-600 dark:text-blue-400">
+                          ▶ {formatTimestamp(n.start)}
+                        </span>
+                      )}
+                      {n.passage}
+                    </p>
+                  ) : n.summary ? (
+                    <p className="mt-1.5 text-sm text-neutral-600 dark:text-neutral-400 line-clamp-2">{n.summary}</p>
+                  ) : null}
+                </div>
+              ))}
+            </div>
           </section>
         )}
       </div>

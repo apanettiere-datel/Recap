@@ -3,6 +3,7 @@ import { db } from "../services/db.js";
 import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
 import { eq, and, desc, ilike, or, sql, inArray, gte, lte, getTableColumns, type SQL } from "drizzle-orm";
 import { enqueueNote, isNoteQueued, draftFollowUp } from "../services/processing.js";
+import { indexNote, semanticNotes } from "../services/semantic.js";
 import { sniffAudioFormat } from "../services/audio.js";
 import { readFile, unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -426,7 +427,28 @@ app.get("/search", async (c) => {
     limit: parseLimit(c.req.query("limit"), 30, 100),
     offset: parseOffset(c.req.query("offset")),
   });
-  return c.json({ query: q, ...result });
+
+  // Conversations related by meaning that the keywords didn't find (first page only)
+  let related: Awaited<ReturnType<typeof semanticNotes>> = [];
+  if (c.req.query("semantic") === "1" && q.length >= 3 && parseOffset(c.req.query("offset")) === 0) {
+    try {
+      const from = parseDateParam(c.req.query("from"));
+      const to = parseDateParam(c.req.query("to"));
+      const shown = new Set(result.notes.map((n) => n.id));
+      related = (await semanticNotes(userId, q, {
+        limit: 12,
+        personId: c.req.query("personId") || null,
+        includeArchived: c.req.query("archived") === "include",
+      }))
+        .filter((n) => !shown.has(n.id))
+        .filter((n) => (!from || n.recordedAt >= from) && (!to || n.recordedAt <= to))
+        .slice(0, 8);
+    } catch (err) {
+      console.warn("[search] semantic search unavailable:", (err as Error).message);
+    }
+  }
+
+  return c.json({ query: q, ...result, related });
 });
 
 // Legacy search path used by the mobile app
@@ -471,6 +493,26 @@ app.patch("/:id", async (c) => {
   if (typeof body.isPinned === "boolean") updates.isPinned = body.isPinned;
   if (typeof body.isArchived === "boolean") updates.isArchived = body.isArchived;
 
+  // Rename speakers: { speakers: { "B": "Sarah" } }
+  let renamed: [string, string][] = [];
+  let previousSpeakers: Record<string, string> = {};
+  if (body.speakers && typeof body.speakers === "object") {
+    const [current] = await db.select({ segments: notes.segments, speakers: notes.speakers }).from(notes)
+      .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+    if (!current) return c.json({ error: "Not found" }, 404);
+    const labels = new Set((current.segments ?? []).map((s) => s.k).filter(Boolean));
+    previousSpeakers = current.speakers ?? {};
+    const next = { ...previousSpeakers };
+    for (const [label, name] of Object.entries(body.speakers as Record<string, unknown>)) {
+      if (!labels.has(label) || typeof name !== "string") continue;
+      const clean = name.trim().slice(0, 80);
+      if (!clean) continue;
+      if (next[label] !== clean) renamed.push([previousSpeakers[label] ?? `Speaker ${label}`, clean]);
+      next[label] = clean;
+    }
+    updates.speakers = next;
+  }
+
   if (Object.keys(updates).length === 0) {
     return c.json({ error: "No fields to update" }, 400);
   }
@@ -482,6 +524,14 @@ app.patch("/:id", async (c) => {
     .returning();
 
   if (!updated) return c.json({ error: "Not found" }, 404);
+
+  if (renamed.length) {
+    // Keep quotes attributed to the new name, and refresh search passages
+    for (const [from, to] of renamed) {
+      await db.update(quotes).set({ speaker: to }).where(and(eq(quotes.noteId, noteId), eq(quotes.speaker, from)));
+    }
+    indexNote(noteId).catch(() => {});
+  }
 
   return c.json(updated);
 });

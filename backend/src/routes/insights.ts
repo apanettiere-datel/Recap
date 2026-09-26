@@ -77,8 +77,8 @@ app.post("/chat", async (c) => {
       if (reply === null) return c.json({ error: "Conversation not found" }, 404);
       return c.json({ reply });
     }
-    const reply = await chatWithNotes(userId, message, body?.history);
-    return c.json({ reply });
+    const { reply, sources } = await chatWithNotes(userId, message, body?.history);
+    return c.json({ reply, sources });
   } catch (err) {
     console.error("[chat] failed:", err);
     return c.json({ error: "The assistant is unavailable right now. Please try again." }, 502);

@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, boolean, real, integer, pgEnum, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, boolean, real, integer, pgEnum, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
 export const commitmentOwnerEnum = pgEnum("commitment_owner", ["me", "them"]);
@@ -26,11 +26,20 @@ export const users = pgTable("users", {
   digestHour: integer("digest_hour").default(8).notNull(),
   timezone: text("timezone").default("UTC").notNull(),
   lastDigestSentAt: timestamp("last_digest_sent_at"),
+  // Names, companies and jargon the transcriber should spell correctly
+  vocabulary: text("vocabulary").array().default([]).notNull(),
+  remindersEnabled: boolean("reminders_enabled").default(false).notNull(),
+  reminderHour: integer("reminder_hour").default(8).notNull(),
+  lastReminderDate: text("last_reminder_date"),
+  calendarIcsUrl: text("calendar_ics_url"),
+  calendarLastSyncAt: timestamp("calendar_last_sync_at"),
+  calendarError: text("calendar_error"),
+  prepBriefsEnabled: boolean("prep_briefs_enabled").default(true).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 /** A timed piece of transcript: start/end seconds and text. */
-export type TranscriptSegment = { s: number; e: number; t: string };
+export type TranscriptSegment = { s: number; e: number; t: string; k?: string };
 
 export const notes = pgTable("notes", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -38,6 +47,10 @@ export const notes = pgTable("notes", {
   title: text("title").default("").notNull(),
   transcript: text("transcript").default("").notNull(),
   segments: jsonb("segments").$type<TranscriptSegment[]>(),
+  // Speaker label (segment.k) → display name, e.g. { "A": "Me", "B": "Sarah" }
+  speakers: jsonb("speakers").$type<Record<string, string>>(),
+  calendarEventId: uuid("calendar_event_id"),
+  meetingTitle: text("meeting_title"),
   summary: text("summary").default("").notNull(),
   sentiment: text("sentiment").default("").notNull(),
   audioUrl: text("audio_url").notNull(),
@@ -80,6 +93,8 @@ export const commitments = pgTable("commitments", {
   completedAt: timestamp("completed_at"),
   priority: text("priority").default("medium"),
   addedToCalendar: boolean("added_to_calendar").default(false).notNull(),
+  dueRemindedAt: timestamp("due_reminded_at"),
+  overdueRemindedAt: timestamp("overdue_reminded_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -140,6 +155,51 @@ export const weeklyReports = pgTable("weekly_reports", {
   avoidedTopics: text("avoided_topics").array().default([]).notNull(),
   suggestedFocus: text("suggested_focus").array().default([]).notNull(),
   generatedAt: timestamp("generated_at").defaultNow().notNull(),
+});
+
+/** Transcript passages with embeddings, for search by meaning. */
+export const noteChunks = pgTable("note_chunks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  noteId: uuid("note_id").notNull().references(() => notes.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  start: real("start"),
+  text: text("text").notNull(),
+  embedding: real("embedding").array(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({
+  userIdx: index("note_chunks_user_idx").on(t.userId),
+  noteIdx: index("note_chunks_note_idx").on(t.noteId),
+}));
+
+export type Attendee = { name: string; email: string | null };
+
+export const calendarEvents = pgTable("calendar_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  uid: text("uid").notNull(),
+  startsAt: timestamp("starts_at").notNull(),
+  endsAt: timestamp("ends_at").notNull(),
+  title: text("title").default("").notNull(),
+  location: text("location"),
+  attendees: jsonb("attendees").$type<Attendee[]>().default([]).notNull(),
+  prepSentAt: timestamp("prep_sent_at"),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (t) => ({
+  occurrence: uniqueIndex("calendar_events_occurrence_idx").on(t.userId, t.uid, t.startsAt),
+  userStart: index("calendar_events_user_start_idx").on(t.userId, t.startsAt),
+}));
+
+/** Public read-only links to a conversation. */
+export const shares = pgTable("shares", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  noteId: uuid("note_id").notNull().references(() => notes.id, { onDelete: "cascade" }),
+  token: text("token").notNull().unique(),
+  includeAudio: boolean("include_audio").default(false).notNull(),
+  includeTranscript: boolean("include_transcript").default(false).notNull(),
+  views: integer("views").default(0).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  revokedAt: timestamp("revoked_at"),
 });
 
 // Relations

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { parseTerms, termsRegExp } from '@/lib/searchTerms'
 import { toast } from '@/lib/toast'
 import { downloadBlob } from '@/lib/uploadRecording'
-import { formatTimestamp } from '@/lib/useNoteAudio'
+import { formatTimestamp, speakerName } from '@/lib/useNoteAudio'
 
 /** Break an untimed transcript (one long run of text) into readable paragraphs. */
 function textParagraphs(text) {
@@ -32,8 +32,9 @@ function segmentParagraphs(segments) {
   for (const seg of segments) {
     const gap = current ? seg.s - current.end : 0
     const len = current ? current.segs.reduce((n, s) => n + s.t.length, 0) : 0
-    if (!current || gap > 2.5 || current.segs.length >= 6 || len > 550) {
-      current = { start: seg.s, end: seg.e, segs: [] }
+    const speakerChanged = current && (seg.k || null) !== current.k
+    if (!current || speakerChanged || gap > 2.5 || current.segs.length >= 6 || len > 550) {
+      current = { start: seg.s, end: seg.e, k: seg.k || null, segs: [] }
       out.push(current)
     }
     current.segs.push(seg)
@@ -42,18 +43,41 @@ function segmentParagraphs(segments) {
   return out
 }
 
+const SPEAKER_COLORS = [
+  'text-blue-600 dark:text-blue-400',
+  'text-emerald-600 dark:text-emerald-400',
+  'text-purple-600 dark:text-purple-400',
+  'text-orange-600 dark:text-orange-400',
+  'text-pink-600 dark:text-pink-400',
+  'text-teal-600 dark:text-teal-400',
+]
+
+
+
 /**
  * Full transcript with:
  * - find-in-transcript (highlights, count, previous/next)
  * - when timed segments exist: timestamps, click any sentence to play from there,
  *   and the sentence being played is highlighted as the audio runs
  */
-export default function TranscriptViewer({ transcript, segments, title, initialQuery = '', currentTime = null, onSeek, stickyTop = 57 }) {
+export default function TranscriptViewer({ transcript, segments, speakers, onRenameSpeaker, title, initialQuery = '', currentTime = null, onSeek, stickyTop = 57 }) {
   const [query, setQuery] = useState(initialQuery)
   const [active, setActive] = useState(0)
   const [follow, setFollow] = useState(true)
   const containerRef = useRef(null)
-  const timed = Array.isArray(segments) && segments.length > 0 && !!onSeek
+  const timed = Array.isArray(segments) && segments.length > 0
+  const canSeek = timed && !!onSeek
+  const [editing, setEditing] = useState(null) // { label, index } of the speaker turn being renamed
+  const [nameDraft, setNameDraft] = useState('')
+  // Same person → same color, even across chunk labels that share a name
+  const colorOf = useMemo(() => {
+    const names = []
+    for (const seg of segments || []) {
+      const n = speakerName(seg.k, speakers)
+      if (n && !names.includes(n)) names.push(n)
+    }
+    return (label) => SPEAKER_COLORS[Math.max(0, names.indexOf(speakerName(label, speakers))) % SPEAKER_COLORS.length]
+  }, [segments, speakers])
 
   const terms = useMemo(() => parseTerms(query), [query])
   const re = useMemo(() => termsRegExp(terms), [terms])
@@ -70,6 +94,7 @@ export default function TranscriptViewer({ transcript, segments, title, initialQ
       : textParagraphs(transcript || '').map((p) => ({ start: null, segs: [{ s: null, e: null, t: p }] }))
     const out = source.map((p) => ({
       start: p.start,
+      k: p.k || null,
       segs: p.segs.map((seg) => ({ ...seg, parts: split(seg.t) })),
     }))
     return { blocks: out, matchCount: n }
@@ -122,7 +147,7 @@ export default function TranscriptViewer({ transcript, segments, title, initialQ
   const download = () => {
     const safe = (title || 'transcript').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'transcript'
     const body = timed
-      ? segmentParagraphs(segments).map((p) => `[${formatTimestamp(p.start)}] ${p.segs.map((s) => s.t).join(' ')}`).join('\n\n')
+      ? segmentParagraphs(segments).map((p) => `[${formatTimestamp(p.start)}] ${p.k ? `${speakerName(p.k, speakers)}: ` : ''}${p.segs.map((s) => s.t).join(' ')}`).join('\n\n')
       : transcript
     downloadBlob(new Blob([body], { type: 'text/plain;charset=utf-8' }), `${safe}.txt`)
   }
@@ -176,12 +201,47 @@ export default function TranscriptViewer({ transcript, segments, title, initialQ
             {timed && (
               <button
                 type="button"
-                onClick={() => onSeek(block.start)}
-                className="shrink-0 self-start w-12 pt-1 text-left text-xs font-medium tabular-nums text-blue-600 dark:text-blue-400 hover:underline"
-                title="Play from here"
+                onClick={() => canSeek && onSeek(block.start)}
+                disabled={!canSeek}
+                className="shrink-0 self-start w-12 pt-1 text-left text-xs font-medium tabular-nums text-blue-600 dark:text-blue-400 hover:underline disabled:no-underline disabled:text-neutral-400"
+                title={canSeek ? 'Play from here' : undefined}
               >
                 {formatTimestamp(block.start)}
               </button>
+            )}
+            <div className="min-w-0 flex-1">
+            {block.k && block.k !== blocks[bi - 1]?.k && (
+              editing?.index === bi ? (
+                <form
+                  className="mb-0.5"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    const name = nameDraft.trim()
+                    if (name && name !== speakerName(block.k, speakers)) onRenameSpeaker?.(block.k, name)
+                    setEditing(null)
+                  }}
+                >
+                  <input
+                    autoFocus
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onBlur={(e) => e.currentTarget.form.requestSubmit()}
+                    onKeyDown={(e) => e.key === 'Escape' && setEditing(null)}
+                    maxLength={80}
+                    aria-label="Speaker name"
+                    className="text-sm font-semibold px-2 py-0.5 rounded-md border border-blue-500 bg-white dark:bg-neutral-900 outline-none"
+                  />
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => { if (!onRenameSpeaker) return; setNameDraft(speakerName(block.k, speakers)); setEditing({ label: block.k, index: bi }) }}
+                  className={`block mb-0.5 text-sm font-semibold ${colorOf(block.k)} ${onRenameSpeaker ? 'hover:underline' : 'cursor-default'}`}
+                  title={onRenameSpeaker ? 'Rename speaker' : undefined}
+                >
+                  {speakerName(block.k, speakers)}
+                </button>
+              )
             )}
             <p className="min-w-0">
               {block.segs.map((seg, si) => {
@@ -198,7 +258,7 @@ export default function TranscriptViewer({ transcript, segments, title, initialQ
                     </mark>
                   ),
                 )
-                if (!timed) return <span key={si}>{content}</span>
+                if (!canSeek) return <span key={si}>{content}{timed ? ' ' : ''}</span>
                 const playing = seg.s === playingStart
                 return (
                   <span
@@ -215,12 +275,13 @@ export default function TranscriptViewer({ transcript, segments, title, initialQ
                 )
               })}
             </p>
+            </div>
           </div>
         ))}
       </div>
       <div className="px-4 pb-3 flex items-center justify-between gap-3 text-xs text-neutral-400">
-        <span>{words.toLocaleString()} words{timed ? ' · click any sentence to play it' : ''}</span>
-        {timed && (
+        <span>{words.toLocaleString()} words{canSeek ? ' · click any sentence to play it' : ''}{onRenameSpeaker && blocks.some((b) => b.k) ? ' · click a name to rename' : ''}</span>
+        {canSeek && (
           <label className="flex items-center gap-1.5 cursor-pointer select-none">
             <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} className="accent-blue-600" />
             Follow playback

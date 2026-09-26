@@ -72,3 +72,9 @@ export function findQuoteTime(quote, segments) {
   }
   return null
 }
+
+/** Display name for a diarized speaker label. */
+export function speakerName(label, speakers) {
+  if (!label) return null
+  return speakers?.[label] || `Speaker ${label}`
+}

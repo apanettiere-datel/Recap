@@ -2,6 +2,7 @@ import { useTheme } from '@/lib/theme'
 import { useApi, API_BASE } from '@/lib/api'
 import { toast } from '@/lib/toast'
 import WeeklyEmailSettings from '@/components/WeeklyEmailSettings'
+import { VocabularySettings, ReminderSettings, CalendarSettings } from '@/components/SmartSettings'
 import { useAuthFetch } from '@/lib/authFetch'
 import { useState } from 'react'
 import { useClerk } from '@clerk/clerk-react'
@@ -112,7 +113,24 @@ export default function Settings() {
           <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
             Email
           </h2>
-          <WeeklyEmailSettings />
+          <div className="space-y-3">
+            <WeeklyEmailSettings />
+            <ReminderSettings />
+          </div>
+        </div>
+
+        <div>
+          <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+            Calendar
+          </h2>
+          <CalendarSettings />
+        </div>
+
+        <div>
+          <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+            Transcription
+          </h2>
+          <VocabularySettings />
         </div>
 
         {/* Export Data */}

@@ -1,7 +1,8 @@
 import OpenAI from "openai";
 import { db } from "./db.js";
 import { notes, commitments, people, topics, notePeople } from "../models/schema.js";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, inArray } from "drizzle-orm";
+import { searchPassages } from "./semantic.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -30,7 +31,7 @@ export async function chatWithNote(userId: string, noteId: string, userMessage: 
 
   const noteCommitments = await db.select().from(commitments).where(eq(commitments.noteId, noteId));
   const timed = note.segments?.length
-    ? note.segments.map((s) => `[${clock(s.s)}] ${s.t}`).join("\n")
+    ? note.segments.map((s) => `[${clock(s.s)}] ${s.k ? `${note.speakers?.[s.k] ?? `Speaker ${s.k}`}: ` : ""}${s.t}`).join("\n")
     : note.transcript;
   const transcript = timed.length > 60000 ? `${timed.slice(0, 60000)}\n[transcript truncated]` : timed;
 
@@ -59,7 +60,46 @@ ${transcript || "(no transcript)"}`,
   return response.choices[0].message.content ?? "I couldn't find that in this conversation.";
 }
 
-export async function chatWithNotes(userId: string, userMessage: string, history?: unknown): Promise<string> {
+export interface ChatSource {
+  n: number;
+  noteId: string;
+  title: string;
+  recordedAt: string;
+  start: number | null;
+}
+
+/** Transcript passages most relevant to the question, from any conversation. */
+async function retrieve(userId: string, question: string, history: ChatTurn[]) {
+  const lastUser = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+  // Follow-up questions ("what about her?") need the previous question for context
+  const query = question.length < 40 && lastUser ? `${lastUser}\n${question}` : question;
+  let hits: Awaited<ReturnType<typeof searchPassages>> = [];
+  try {
+    hits = await searchPassages(userId, query, { limit: 10, minScore: 0.2 });
+  } catch (err) {
+    console.warn("[chat] retrieval unavailable:", (err as Error).message);
+  }
+  if (hits.length === 0) return { block: "", sources: [] as ChatSource[] };
+  const meta = await db
+    .select({ id: notes.id, title: notes.title, recordedAt: notes.recordedAt })
+    .from(notes)
+    .where(and(eq(notes.userId, userId), inArray(notes.id, [...new Set(hits.map((h) => h.noteId))])));
+  const byId = new Map(meta.map((m) => [m.id, m]));
+  const sources: ChatSource[] = [];
+  const lines: string[] = [];
+  for (const h of hits) {
+    const m = byId.get(h.noteId);
+    if (!m) continue;
+    const n = sources.length + 1;
+    sources.push({ n, noteId: h.noteId, title: m.title || "Untitled", recordedAt: m.recordedAt.toISOString(), start: h.start });
+    lines.push(`[${n}] "${m.title || "Untitled"}" (${m.recordedAt.toISOString().split("T")[0]}${h.start != null ? `, at ${clock(h.start)}` : ""}):\n${h.text}`);
+  }
+  return { block: lines.join("\n\n"), sources };
+}
+
+export async function chatWithNotes(userId: string, userMessage: string, history?: unknown): Promise<{ reply: string; sources: ChatSource[] }> {
+  const turns = sanitizeHistory(history);
+  const retrieved = await retrieve(userId, userMessage, turns);
   const userNotes = await db
     .select()
     .from(notes)
@@ -117,12 +157,16 @@ IMPORTANT RULES:
 
 ${userNotes.length === 0 ? "The user has NO recorded conversations yet." : `User's conversation history (${userNotes.length} conversations):\n${notesContext}`}
 
-${userPeople.length === 0 ? "The user has NO people in their contacts yet." : `People the user talks to:\n${peopleContext}`}`,
+${userPeople.length === 0 ? "The user has NO people in their contacts yet." : `People the user talks to:\n${peopleContext}`}
+${retrieved.block ? `\nRelevant excerpts from the full transcripts (these may come from older conversations not listed above). When you use one, cite it by number like [1] or [2]:\n\n${retrieved.block}` : ""}`,
       },
-      ...sanitizeHistory(history),
+      ...turns,
       { role: "user", content: userMessage },
     ],
   });
 
-  return response.choices[0].message.content ?? "I couldn't find anything relevant.";
+  const reply = response.choices[0].message.content ?? "I couldn't find anything relevant.";
+  // Only return the sources the answer actually cites
+  const cited = new Set([...reply.matchAll(/\[(\d{1,2})\]/g)].map((m) => Number(m[1])));
+  return { reply, sources: retrieved.sources.filter((s) => cited.has(s.n)) };
 }

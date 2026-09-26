@@ -2,11 +2,33 @@ import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useApi } from '@/lib/api'
+import { formatTimestamp } from '@/lib/useNoteAudio'
 
 const TIMESTAMP_RE = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g
 
 function toSeconds(stamp) {
   return stamp.split(':').map(Number).reduce((acc, n) => acc * 60 + n, 0)
+}
+
+/** Render an answer whose [1], [2] citations link to the passages they came from. */
+function CitedText({ text, sources, onOpen }) {
+  const byN = new Map(sources.map((s) => [s.n, s]))
+  return text.split(/\[(\d{1,2})\]/g).map((part, i) => {
+    if (i % 2 === 0) return part
+    const s = byN.get(Number(part))
+    if (!s) return `[${part}]`
+    return (
+      <button
+        key={i}
+        type="button"
+        onClick={() => onOpen(s)}
+        title={`${s.title}${s.start != null ? ` at ${formatTimestamp(s.start)}` : ''}`}
+        className="inline-flex items-center justify-center min-w-[1.25rem] h-5 mx-0.5 px-1 rounded-md bg-blue-500/10 text-blue-600 dark:text-blue-400 text-xs font-semibold align-text-top hover:bg-blue-500/20"
+      >
+        {part}
+      </button>
+    )
+  })
 }
 
 /** Render an answer, turning [12:34] citations into links that play that moment. */
@@ -34,6 +56,7 @@ export default function Chat() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const noteId = searchParams.get('noteId')
+  const openSource = (s) => navigate(`/note/${s.noteId}${s.start != null ? `?t=${Math.floor(s.start)}` : ''}`)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const messagesEndRef = useRef(null)
@@ -57,7 +80,7 @@ export default function Chat() {
     onSuccess: (data) => {
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: data.reply },
+        { role: 'assistant', content: data.reply, sources: data.sources || [] },
       ])
     },
     onError: (err) => {
@@ -176,9 +199,30 @@ export default function Chat() {
                   >
                     <p className="whitespace-pre-wrap">
                       {msg.role === 'assistant'
-                        ? <AnswerText text={msg.content} onSeek={noteId ? (t) => navigate(`/note/${noteId}?t=${t}`) : null} />
+                        ? (msg.sources?.length
+                          ? <CitedText text={msg.content} sources={msg.sources} onOpen={openSource} />
+                          : <AnswerText text={msg.content} onSeek={noteId ? (t) => navigate(`/note/${noteId}?t=${t}`) : null} />)
                         : msg.content}
                     </p>
+                    {msg.sources?.length > 0 && (
+                      <div className="mt-3 pt-2 border-t border-neutral-100 dark:border-neutral-800 space-y-1">
+                        {msg.sources.map((s) => (
+                          <button
+                            key={s.n}
+                            type="button"
+                            onClick={() => openSource(s)}
+                            className="w-full flex items-center gap-2 text-left text-xs text-neutral-500 hover:text-blue-600 dark:hover:text-blue-400"
+                          >
+                            <span className="w-5 h-5 rounded-md bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold flex items-center justify-center shrink-0">{s.n}</span>
+                            <span className="truncate">{s.title}</span>
+                            <span className="shrink-0 text-neutral-400">
+                              {new Date(s.recordedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                              {s.start != null ? ` · ${formatTimestamp(s.start)}` : ''}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}

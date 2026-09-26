@@ -23,6 +23,7 @@ const Briefing = React.lazy(() => import('./pages/Briefing'))
 const Commitments = React.lazy(() => import('./pages/Commitments'))
 const Archive = React.lazy(() => import('./pages/Archive'))
 const Entities = React.lazy(() => import('./pages/Entities'))
+const SharedNote = React.lazy(() => import('./pages/SharedNote'))
 
 function Loading() {
   return (
@@ -93,7 +94,22 @@ function UserSync() {
   return null
 }
 
+/** Shared links (/s/:token) are public: no sign-in, no app chrome. */
+function PublicRoutes() {
+  return (
+    <ErrorBoundary>
+      <Suspense fallback={<Loading />}>
+        <Routes>
+          <Route path="s/:token" element={<SharedNote />} />
+        </Routes>
+      </Suspense>
+    </ErrorBoundary>
+  )
+}
+
 export default function App() {
+  const location = useLocation()
+  if (location.pathname.startsWith('/s/')) return <PublicRoutes />
   if (CLERK_KEY) {
     return <AuthGuardedApp />
   }

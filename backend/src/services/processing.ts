@@ -8,6 +8,11 @@ import { notes, commitments, topics, people, notePeople, quotes, tags, type Tran
 import { eq, and, lt, sql } from "drizzle-orm";
 import { generateInsights } from "./insights.js";
 import { hasFfmpeg, normalizeAndSplit, sniffAudioFormat, AudioDecodeError, CHUNK_DURATION_SECS } from "./audio.js";
+import { getOpenAI, ProcessingError, withRetry, chatJSON } from "./ai.js";
+import { users } from "../models/schema.js";
+import { identifySpeakers, labeledTranscript, vocabularyPrompt, correctVocabulary, speakerLabels } from "./speakers.js";
+import { findMeetingForRecording, linkMeetingAttendees, type CalendarEvent } from "./calendar.js";
+import { indexNote } from "./semantic.js";
 
 const WHISPER_MAX_BYTES = 24 * 1024 * 1024; // 24MB (Whisper limit is 25MB)
 const MAX_CONCURRENT_NOTES = 2;
@@ -16,30 +21,6 @@ const CHUNK_TRANSCRIBE_CONCURRENCY = 3;
 const MAP_REDUCE_THRESHOLD_CHARS = 60_000;
 const MAP_SEGMENT_CHARS = 20_000;
 const RECOVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
-let openaiClient: OpenAI | null = null;
-function getOpenAI(): OpenAI {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new ProcessingError("The transcription service is not configured (missing OPENAI_API_KEY).");
-  }
-  if (!openaiClient) {
-    // The SDK retries 408/409/429/5xx and connection errors with exponential backoff
-    openaiClient = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-      maxRetries: 4,
-      timeout: 5 * 60 * 1000,
-    });
-  }
-  return openaiClient;
-}
-
-/** An error whose message is safe and useful to show to the user. */
-class ProcessingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ProcessingError";
-  }
-}
 
 type EntityType = "PERSON" | "ORGANIZATION" | "PHONE" | "DATE" | "EMAIL" | "LOCATION";
 const ENTITY_TYPES: EntityType[] = ["PERSON", "ORGANIZATION", "PHONE", "DATE", "EMAIL", "LOCATION"];
@@ -180,15 +161,58 @@ export async function processNote(noteId: string, userId: string, opts: { retran
       .where(eq(notes.id, noteId));
 
     let transcript = note.transcript ?? "";
+    let segments = note.segments ?? [];
+    let speakers = note.speakers ?? null;
     const needsTranscription = !!note.audioUrl && (opts.retranscribe || !transcript.trim());
 
+    const [user] = await db.select().from(users).where(eq(users.id, userId));
+    const knownPeople = await db.select().from(people).where(eq(people.userId, userId));
+    const humanNames = knownPeople.filter((p) => p.relationship !== "organization").map((p) => p.name);
+    // User's custom terms first (they matter most), then people and organizations they know
+    const vocabulary = [...new Set([...(user?.vocabulary ?? []), ...knownPeople.map((p) => p.name)])].slice(0, 200);
+
+    // The calendar meeting this recording belongs to, if any: title and attendees help
+    // name speakers and link people
+    let meeting: CalendarEvent | null = null;
+    try {
+      meeting = await findMeetingForRecording(userId, note.recordedAt, note.duration);
+    } catch (err) {
+      console.warn("[processNote] meeting lookup failed:", (err as Error).message);
+    }
+    const attendeeNames = (meeting?.attendees ?? []).map((a) => a.name).filter(Boolean);
+
     if (needsTranscription) {
-      const result = await transcribeAudio(note.audioUrl, (stage) => setStage(noteId, stage));
+      const result = await transcribeAudio(note.audioUrl, (stage) => setStage(noteId, stage), { prompt: vocabularyPrompt(vocabulary) });
       transcript = result.transcript;
+      segments = result.segments;
+
+      if (vocabulary.length && transcript.trim()) {
+        await setStage(noteId, "Checking names and terms");
+        try {
+          const corrected = await correctVocabulary(segments, transcript, vocabulary);
+          segments = corrected.segments;
+          transcript = corrected.transcript;
+          if (corrected.replacements.length) console.log(`[processNote] ${noteId}: fixed ${corrected.replacements.length} term spelling(s)`);
+        } catch (err) {
+          console.warn("[processNote] vocabulary correction skipped:", (err as Error).message);
+        }
+      }
+
+      speakers = null;
+      if (speakerLabels(segments).length > 0) {
+        await setStage(noteId, "Identifying speakers");
+        try {
+          speakers = await identifySpeakers(segments, { knownPeople: humanNames, attendees: attendeeNames, meetingTitle: meeting?.title });
+        } catch (err) {
+          console.warn("[processNote] speaker naming skipped:", (err as Error).message);
+          speakers = Object.fromEntries(speakerLabels(segments).map((k, i) => [k, `Speaker ${i + 1}`]));
+        }
+      }
 
       const updates: Partial<typeof notes.$inferInsert> = {
         transcript,
-        segments: result.segments.length > 0 ? result.segments : null,
+        segments: segments.length > 0 ? segments : null,
+        speakers,
       };
       // Recovered or interrupted recordings may not know their duration — trust the decoder
       if (result.durationSecs && (!note.duration || Math.abs(note.duration - result.durationSecs) > 5)) {
@@ -214,14 +238,35 @@ export async function processNote(noteId: string, userId: string, opts: { retran
       return;
     }
 
+    if (meeting) {
+      await db.update(notes).set({ calendarEventId: meeting.id, meetingTitle: meeting.title || null }).where(eq(notes.id, noteId));
+    }
+
     await setStage(noteId, "Analyzing conversation");
-    const knownPeople = await db.select().from(people).where(eq(people.userId, userId));
-    const analysis = transcript.length > MAP_REDUCE_THRESHOLD_CHARS
-      ? await analyzeLongTranscript(transcript, note.conversationMode, knownPeople)
-      : await analyzeTranscript(transcript, note.conversationMode, knownPeople);
+    // With speaker labels the model knows who said what: better quotes and commitment owners
+    const labeled = speakers && segments.some((s) => s.k)
+      ? `(Each line starts with the speaker's name. "Me" is the person who recorded this; commitments made by Me have owner "me".${meeting ? ` This was the calendar meeting "${meeting.title}"${attendeeNames.length ? ` with ${attendeeNames.join(", ")}` : ""}.` : ""})\n${labeledTranscript(segments, speakers)}`
+      : meeting
+        ? `(This was the calendar meeting "${meeting.title}"${attendeeNames.length ? ` with ${attendeeNames.join(", ")}` : ""}.)\n${transcript}`
+        : transcript;
+    const peopleForAnalysis = [
+      ...knownPeople,
+      ...attendeeNames
+        .filter((n) => !knownPeople.some((p) => p.name.toLowerCase() === n.toLowerCase()))
+        .map((name) => ({ name, keywords: [] as string[], relationship: "meeting attendee" })),
+    ];
+    const analysis = labeled.length > MAP_REDUCE_THRESHOLD_CHARS
+      ? await analyzeLongTranscript(labeled, note.conversationMode, peopleForAnalysis)
+      : await analyzeTranscript(labeled, note.conversationMode, peopleForAnalysis);
 
     await setStage(noteId, "Saving results");
     await saveAnalysis(noteId, userId, note.recordedAt, analysis);
+
+    if (meeting) {
+      await linkMeetingAttendees(userId, noteId, meeting).catch((e) => console.warn("[processNote] linking attendees failed:", e));
+    }
+    // Search by meaning; never blocks the note from being ready
+    indexNote(noteId).catch((e) => console.warn("[processNote] semantic indexing failed:", (e as Error).message));
 
     console.log(`[processNote] ${noteId}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
 
@@ -281,14 +326,14 @@ interface FileTranscript {
 
 /** Shift a chunk's segment times by where that chunk starts in the whole recording. */
 function offsetSegments(segments: TranscriptSegment[], offset: number): TranscriptSegment[] {
-  return segments.map((s) => ({ s: round2(s.s + offset), e: round2(s.e + offset), t: s.t }));
+  return segments.map((s) => ({ ...s, s: round2(s.s + offset), e: round2(s.e + offset) }));
 }
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
 
-async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Promise<void>): Promise<TranscriptionResult> {
+async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Promise<void>, opts: { prompt?: string } = {}): Promise<TranscriptionResult> {
   const workDir = await mkdtemp(join(tmpdir(), "recap-audio-"));
   try {
     let filePath: string;
@@ -328,7 +373,7 @@ async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Pro
       await onStage("Transcribing audio");
       const header = await readHeader(filePath);
       const { ext, mime } = sniffAudioFormat(header);
-      const result = cleanFileTranscript(await transcribeFile(filePath, `audio.${ext}`, mime));
+      const result = cleanFileTranscript(await transcribeFile(filePath, `audio.${ext}`, mime, opts));
       return { transcript: result.text, segments: result.segments, durationSecs };
     }
 
@@ -347,10 +392,12 @@ async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Pro
     let done = 0;
     const results = await mapWithConcurrency(chunkPaths, CHUNK_TRANSCRIBE_CONCURRENCY, async (path, i) => {
       try {
-        const result = cleanFileTranscript(await transcribeFile(path, `chunk_${i}.mp3`, "audio/mpeg"));
+        const result = cleanFileTranscript(await transcribeFile(path, `chunk_${i}.mp3`, "audio/mpeg", opts));
         done++;
         if (total > 1) await onStage(`Transcribing audio (${done} of ${total})`);
-        return { text: result.text, segments: offsetSegments(result.segments, offsets[i]) };
+        // Speaker labels restart in each chunk; prefix them so "A" in part 1 ≠ "A" in part 2
+        const segments = total > 1 ? result.segments.map((sg) => (sg.k ? { ...sg, k: `${i + 1}${sg.k}` } : sg)) : result.segments;
+        return { text: result.text, segments: offsetSegments(segments, offsets[i]) };
       } catch (err) {
         if (total > 1 && err instanceof Error) err.message = `part ${i + 1} of ${total}: ${err.message}`;
         throw err;
@@ -390,14 +437,70 @@ interface WhisperSegment {
   avg_logprob?: number;
 }
 
-async function transcribeFile(filePath: string, filename: string, mime: string): Promise<FileTranscript> {
+const DIARIZE_MODEL = "gpt-4o-transcribe-diarize";
+// Turned off for the rest of the process if the account can't use the diarizing model
+let diarizeAvailable = process.env.DIARIZE !== "off";
+
+interface DiarizedSegment {
+  speaker?: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+/**
+ * Transcribe one audio file. Tries the diarizing model first ("who said what");
+ * falls back to Whisper — which also honours the vocabulary prompt — if that model
+ * is unavailable or its result can't be used.
+ */
+async function transcribeFile(filePath: string, filename: string, mime: string, opts: { prompt?: string } = {}): Promise<FileTranscript> {
   const data = await readFile(filePath);
+
+  if (diarizeAvailable) {
+    try {
+      const result = await withRetry(`diarize ${filename}`, async () => {
+        const file = new File([data], filename, { type: mime });
+        return await getOpenAI().audio.transcriptions.create(
+          { model: DIARIZE_MODEL, file, response_format: "diarized_json", chunking_strategy: "auto" } as never,
+          { maxRetries: 0 },
+        ) as unknown as { text?: string; segments?: DiarizedSegment[] };
+      });
+      const segments = (result?.segments ?? [])
+        .map((s) => ({
+          s: round2(Number(s.start) || 0),
+          e: round2(Number(s.end) || 0),
+          t: String(s.text ?? "").trim(),
+          k: String(s.speaker ?? "").trim().slice(0, 20) || undefined,
+        }))
+        .filter((s) => s.t);
+      if (segments.length > 0 || !String(result?.text ?? "").trim()) {
+        return { text: segments.map((s) => s.t).join(" "), segments };
+      }
+      console.warn("[transcribe] diarized result had text but no segments; using Whisper");
+    } catch (err) {
+      if (err instanceof OpenAI.APIError && [400, 403, 404].includes(err.status ?? 0)) {
+        console.warn(`[transcribe] diarization unavailable (${err.status}: ${err.message}); using Whisper from now on`);
+        diarizeAvailable = false;
+      } else if (err instanceof OpenAI.APIError && err.status === 401) {
+        throw err;
+      } else {
+        console.warn(`[transcribe] diarization failed (${(err as Error).message}); using Whisper for this file`);
+      }
+    }
+  }
+
   // The SDK's own retries re-send an already-consumed multipart stream and hang, so
   // retry here with a fresh File each attempt instead.
   return withRetry(`transcribe ${filename}`, async () => {
     const file = new File([data], filename, { type: mime });
     const res = await getOpenAI().audio.transcriptions.create(
-      { model: "whisper-1", file, response_format: "verbose_json", timestamp_granularities: ["segment"] },
+      {
+        model: "whisper-1",
+        file,
+        response_format: "verbose_json",
+        timestamp_granularities: ["segment"],
+        ...(opts.prompt ? { prompt: opts.prompt } : {}),
+      },
       { maxRetries: 0 },
     ) as unknown as { text?: string; segments?: WhisperSegment[] } | string;
 
@@ -410,29 +513,6 @@ async function transcribeFile(filePath: string, filename: string, mime: string):
     const text = segments.length > 0 || res.segments ? segments.map((s) => s.t).join(" ") : String(res.text ?? "");
     return { text, segments };
   });
-}
-
-function isRetryable(err: unknown): boolean {
-  if (err instanceof OpenAI.APIConnectionError) return true; // includes timeouts
-  if (err instanceof OpenAI.APIError) {
-    const status = err.status ?? 0;
-    if (status === 429) return !/quota/i.test(err.message);
-    return status === 408 || status === 409 || status >= 500;
-  }
-  return false;
-}
-
-async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
-  for (let i = 0; ; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (i >= attempts - 1 || !isRetryable(err)) throw err;
-      const delay = Math.round(Math.min(1000 * 2 ** i, 20_000) * (0.75 + Math.random() * 0.5));
-      console.warn(`[retry] ${label} failed (${(err as Error).message}); attempt ${i + 2}/${attempts} in ${delay}ms`);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
 }
 
 // Whisper tends to hallucinate these on silent audio
@@ -507,32 +587,6 @@ ${input.transcript.slice(0, 12000)}`,
   const body = str(raw.body, 5000);
   if (!body) throw new ProcessingError("The draft came back empty. Please try again.");
   return { subject, body };
-}
-
-async function chatJSON(system: string, user: string): Promise<Record<string, unknown>> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const response = await getOpenAI().chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-    });
-    const content = response.choices[0]?.message?.content;
-    try {
-      if (!content) throw new Error("empty response");
-      const parsed = JSON.parse(content);
-      if (parsed && typeof parsed === "object") return parsed;
-      throw new Error("response was not an object");
-    } catch (err) {
-      lastError = err;
-      console.warn(`[analyze] invalid JSON from model (attempt ${attempt + 1}):`, (err as Error).message);
-    }
-  }
-  throw new ProcessingError(`Analysis returned an unreadable result (${(lastError as Error)?.message}). Please retry.`);
 }
 
 function knownPeopleContext(knownPeople: KnownPerson[]): string {
@@ -733,6 +787,11 @@ ${transcript}`;
 // ---------------------------------------------------------------------------
 
 const SKIP_NAMES = new Set(["unknown", "me", "myself", "i", "the user", "user", "speaker", "recorder", "narrator", "you", ""]);
+/** Placeholder names that must never become contacts. */
+function isPlaceholderName(name: string) {
+  const n = name.trim().toLowerCase();
+  return SKIP_NAMES.has(n) || /^(speaker|voice|person|participant)\s*[a-z0-9]{0,3}$/.test(n);
+}
 const SENTIMENTS = new Set(["positive", "negative", "neutral", "tense", "excited", "cautious", "mixed"]);
 
 function str(v: unknown, max = 2000): string {
@@ -771,7 +830,7 @@ function parseDueDate(v: unknown): string | null {
 }
 
 function normalizeAnalysis(raw: Record<string, unknown>): AnalysisResult {
-  const people = uniqueStrings(arr(raw.people), 30).filter((p) => !SKIP_NAMES.has(p.toLowerCase()));
+  const people = uniqueStrings(arr(raw.people), 30).filter((p) => !isPlaceholderName(p));
 
   const commitments: Commitment[] = arr(raw.commitments)
     .map((c) => (c && typeof c === "object" ? (c as Record<string, unknown>) : { description: c }))
@@ -954,7 +1013,7 @@ async function enrichPeopleFromEntities(
 async function findOrCreatePerson(tx: Tx, userId: string, name: string, cache: Map<string, Person | null>): Promise<Person | null> {
   const normalized = name.trim();
   const key = normalized.toLowerCase();
-  if (SKIP_NAMES.has(key)) return null;
+  if (isPlaceholderName(key)) return null;
   if (cache.has(key)) return cache.get(key)!;
 
   const [exact] = await tx
@@ -975,6 +1034,20 @@ async function findOrCreatePerson(tx: Tx, userId: string, name: string, cache: M
       ))
       .limit(1);
     found = byKeyword ?? null;
+  }
+
+  if (!found && !normalized.includes(" ")) {
+    // "Sarah" → the one contact named "Sarah …", if there's exactly one
+    const byFirstName = await tx
+      .select()
+      .from(people)
+      .where(and(
+        eq(people.userId, userId),
+        sql`lower(${people.name}) like ${`${key.replace(/[\\%_]/g, (ch) => `\\${ch}`)} %`}`,
+        sql`${people.relationship} <> 'organization'`,
+      ))
+      .limit(2);
+    if (byFirstName.length === 1) found = byFirstName[0];
   }
 
   if (!found) {

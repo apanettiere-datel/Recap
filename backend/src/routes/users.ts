@@ -70,6 +70,59 @@ app.patch("/me/digest", async (c) => {
   return c.json(digestSettings(updated));
 });
 
+// Custom vocabulary: names, companies and jargon the transcriber should spell correctly
+app.get("/me/vocabulary", async (c) => {
+  const user = await currentUser(c.get("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  return c.json({ terms: user.vocabulary ?? [] });
+});
+
+app.put("/me/vocabulary", async (c) => {
+  const body = await c.req.json<{ terms?: unknown }>().catch(() => null);
+  if (!body || !Array.isArray(body.terms)) return c.json({ error: "Send { terms: [...] }" }, 400);
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const t of body.terms) {
+    if (typeof t !== "string") continue;
+    const clean = t.trim().replace(/\s+/g, " ").slice(0, 60);
+    if (!clean || seen.has(clean.toLowerCase())) continue;
+    seen.add(clean.toLowerCase());
+    terms.push(clean);
+  }
+  if (terms.length > 300) return c.json({ error: "Keep the list under 300 terms." }, 400);
+  const [updated] = await db.update(users).set({ vocabulary: terms }).where(eq(users.id, c.get("userId"))).returning();
+  return c.json({ terms: updated.vocabulary });
+});
+
+// Commitment reminder emails
+app.get("/me/reminders", async (c) => {
+  const user = await currentUser(c.get("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  return c.json({ enabled: user.remindersEnabled, hour: user.reminderHour, timezone: user.timezone, email: user.digestEmail || user.email || "", emailConfigured: isEmailConfigured() });
+});
+
+app.patch("/me/reminders", async (c) => {
+  const body = await c.req.json<{ enabled?: boolean; hour?: number; timezone?: string }>().catch(() => null);
+  if (!body) return c.json({ error: "Invalid request body" }, 400);
+  const user = await currentUser(c.get("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  const updates: Partial<typeof users.$inferInsert> = {};
+  if (body.hour !== undefined) {
+    if (!Number.isInteger(body.hour) || body.hour < 0 || body.hour > 23) return c.json({ error: "Invalid hour" }, 400);
+    updates.reminderHour = body.hour;
+  }
+  if (body.timezone !== undefined) {
+    if (!isValidTimezone(body.timezone)) return c.json({ error: "Invalid timezone" }, 400);
+    updates.timezone = body.timezone;
+  }
+  if (body.enabled !== undefined) {
+    if (body.enabled && !(user.digestEmail || user.email)) return c.json({ error: "Add an email address under Weekly email summary first." }, 400);
+    updates.remindersEnabled = !!body.enabled;
+  }
+  const [updated] = Object.keys(updates).length ? await db.update(users).set(updates).where(eq(users.id, user.id)).returning() : [user];
+  return c.json({ enabled: updated.remindersEnabled, hour: updated.reminderHour, timezone: updated.timezone, email: updated.digestEmail || updated.email || "", emailConfigured: isEmailConfigured() });
+});
+
 app.get("/me/digest/preview", async (c) => {
   const digest = await buildDigest(c.get("userId"));
   return c.json(digest);

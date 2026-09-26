@@ -135,6 +135,7 @@ export function useApi() {
     get: (path, opts) => request(authFetch, path, opts),
     post: (path, body, opts) => request(authFetch, path, { ...opts, method: 'POST', body: body ?? {} }),
     patch: (path, body, opts) => request(authFetch, path, { ...opts, method: 'PATCH', body }),
+    put: (path, body, opts) => request(authFetch, path, { ...opts, method: 'PUT', body }),
     del: (path, opts) => request(authFetch, path, { ...opts, method: 'DELETE' }),
     upload: (path, formData, opts) => uploadWithProgress(getHeaders, path, formData, opts),
     putRaw: (path, blob, opts) => request(authFetch, path, { timeout: 120000, ...opts, method: 'PUT', raw: blob }),

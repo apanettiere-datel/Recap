@@ -12,6 +12,7 @@ import ShareSheet from '@/components/ShareSheet'
 import ProcessingStatus from '@/components/ProcessingStatus'
 import TranscriptViewer from '@/components/TranscriptViewer'
 import FollowUpEmail from '@/components/FollowUpEmail'
+import ShareLinkDialog from '@/components/ShareLinkDialog'
 
 export default function NoteDetail() {
   const { id } = useParams()
@@ -30,6 +31,7 @@ export default function NoteDetail() {
   const [showShare, setShowShare] = useState(false)
   const [showMenu, setShowMenu] = useState(false)
   const [showFollowUp, setShowFollowUp] = useState(false)
+  const [showShareLink, setShowShareLink] = useState(false)
   const [tagInput, setTagInput] = useState('')
   const [showTagInput, setShowTagInput] = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
@@ -125,6 +127,15 @@ export default function NoteDetail() {
       queryClient.invalidateQueries({ queryKey: ['commitments'] })
       toast.info('Conversation deleted')
       navigate('/', { replace: true })
+    },
+  })
+
+  const renameSpeaker = useMutation({
+    mutationFn: (speakers) => api.patch(`/notes/${id}`, { speakers }),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(['note', id], (prev) => (prev ? { ...prev, speakers: updated.speakers } : prev))
+      queryClient.invalidateQueries({ queryKey: ['note', id] })
+      toast.success('Speaker renamed')
     },
   })
 
@@ -236,6 +247,7 @@ export default function NoteDetail() {
                 <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
                 <div className="absolute right-0 top-11 z-20 w-56 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl py-1.5 text-sm">
                   <MenuItem onClick={() => { setShowMenu(false); setTitleDraft(note.title || ''); setEditingTitle(true) }}>Rename</MenuItem>
+                  {!note.isProcessing && <MenuItem onClick={() => { setShowMenu(false); setShowShareLink(true) }}>Share link…</MenuItem>}
                   <MenuItem onClick={() => { setShowMenu(false); toggleArchive.mutate() }}>{note.isArchived ? 'Unarchive' : 'Archive'}</MenuItem>
                   {!note.isProcessing && (note.audioUrl || hasTranscript) && (
                     <MenuItem onClick={() => { setShowMenu(false); reprocess.mutate(false) }}>Re-run analysis</MenuItem>
@@ -289,6 +301,14 @@ export default function NoteDetail() {
 
         <div className="flex items-center gap-2 flex-wrap mb-6 text-sm text-neutral-500 dark:text-neutral-400">
           <span>{formatFullDate(note.recordedAt)}</span>
+          {note.meetingTitle && (
+            <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-700 dark:text-blue-300" title="Matched to your calendar">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5" />
+              </svg>
+              {note.meetingTitle}
+            </span>
+          )}
           {note.duration > 0 && <><span aria-hidden>·</span><span>{formatDuration(note.duration)}</span></>}
           {note.sentiment && !note.isProcessing && (
             <span className={`text-xs font-medium px-2 py-0.5 rounded-full capitalize ${sentimentColor(note.sentiment)}`}>{note.sentiment}</span>
@@ -477,6 +497,8 @@ export default function NoteDetail() {
               <TranscriptViewer
                 transcript={note.transcript}
                 segments={note.segments}
+                speakers={note.speakers}
+                onRenameSpeaker={(label, name) => renameSpeaker.mutate({ [label]: name })}
                 title={note.title}
                 initialQuery={initialQuery}
                 currentTime={playTime}
@@ -512,6 +534,7 @@ export default function NoteDetail() {
 
       <ShareSheet open={showShare} onClose={() => setShowShare(false)} note={note} />
       {showFollowUp && <FollowUpEmail noteId={id} onClose={() => setShowFollowUp(false)} />}
+      {showShareLink && <ShareLinkDialog noteId={id} hasAudio={!!note.audioUrl} onClose={() => setShowShareLink(false)} />}
     </div>
   )
 }

@@ -5,6 +5,8 @@ import { users } from "../models/schema.js";
 import { generateWeeklyReport, generateInsights } from "../services/insights.js";
 import { buildDigest, localDayHour } from "../services/digest.js";
 import { sendEmail, isEmailConfigured } from "../services/email.js";
+import { sendDueReminders } from "../services/reminders.js";
+import { syncAllCalendars, sendPrepBriefs } from "../services/calendar.js";
 
 /**
  * Send weekly summaries that are due. Each user picks a weekday and hour in their own
@@ -70,6 +72,19 @@ export function startWeeklyJobs() {
   // Weekly email summaries: check hourly, each user on their own schedule
   cron.schedule("7 * * * *", () => {
     sendDueDigests().catch((err) => console.error("[cron] Digest job failed:", err));
+  });
+
+  // Commitment reminders: hourly check, each user at their own hour
+  cron.schedule("12 * * * *", () => {
+    sendDueReminders().catch((err) => console.error("[cron] Reminder job failed:", err));
+  });
+
+  // Calendars: refresh every 15 minutes; prep briefs ~30 min before meetings
+  cron.schedule("*/15 * * * *", () => {
+    syncAllCalendars().catch((err) => console.error("[cron] Calendar sync failed:", err));
+  });
+  cron.schedule("*/5 * * * *", () => {
+    sendPrepBriefs().catch((err) => console.error("[cron] Prep briefs failed:", err));
   });
 
   console.log("[cron] Weekly email summaries: hourly check");
