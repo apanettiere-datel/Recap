@@ -36,11 +36,14 @@ jobs:
           CLERK_SK: ${{ secrets.CLERK_SECRET_KEY }}
           PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
           CLERK_PK: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
+          SMTP_URL: ${{ secrets.SMTP_URL }}
+          RESEND_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ubuntu
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS,CLERK_PK
+          envs: DB_URL,OAI_KEY,CLERK_SK,PG_PASS,CLERK_PK,SMTP_URL,RESEND_KEY,EMAIL_FROM
           command_timeout: 15m
           script: |
             set -e
@@ -53,6 +56,10 @@ jobs:
             POSTGRES_PASSWORD=${PG_PASS}
             NODE_ENV=production
             PORT=3000
+            APP_URL=https://personalrecap.com
+            SMTP_URL=${SMTP_URL}
+            RESEND_API_KEY=${RESEND_KEY}
+            EMAIL_FROM=${EMAIL_FROM}
             ENVEOF
             sed -i 's/^[[:space:]]*//' ~/recap/backend/.env
 
@@ -118,6 +125,9 @@ jobs:
                     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                     proxy_set_header X-Forwarded-Proto $scheme;
                     client_max_body_size 250M;
+                    client_body_timeout 300s;
+                    proxy_read_timeout 300s;
+                    proxy_send_timeout 300s;
                 }
             }
             NGINX

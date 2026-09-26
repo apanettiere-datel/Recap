@@ -25,6 +25,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         "Recap can add commitments to your calendar.",
       NSSpeechRecognitionUsageDescription:
         "Recap uses speech recognition to transcribe conversations.",
+      // Keep recording when the screen locks or you switch apps
+      UIBackgroundModes: ["audio"],
     },
   },
   android: {
@@ -33,7 +35,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       backgroundColor: "#ffffff",
     },
     package: "com.recap.app",
-    permissions: ["RECORD_AUDIO", "READ_CALENDAR", "WRITE_CALENDAR"],
+    permissions: ["RECORD_AUDIO", "READ_CALENDAR", "WRITE_CALENDAR", "WAKE_LOCK"],
     edgeToEdgeEnabled: true,
   },
   plugins: [
@@ -62,7 +64,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     "./plugins/withRecordWidget",
   ],
   extra: {
-    apiUrl: process.env.API_URL || "https://api.recap.app/api",
+    apiUrl: process.env.API_URL || "https://api.personalrecap.com/api",
     eas: {
       projectId: process.env.EAS_PROJECT_ID || "",
     },

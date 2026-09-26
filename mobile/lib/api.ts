@@ -3,7 +3,7 @@ import { useAuthStore } from '../stores/auth';
 
 const BASE_URL = __DEV__
   ? 'http://localhost:3000/api'
-  : (Constants.expoConfig?.extra?.apiUrl as string) || 'https://api.recap.app/api';
+  : (Constants.expoConfig?.extra?.apiUrl as string) || 'https://api.personalrecap.com/api';
 
 type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 

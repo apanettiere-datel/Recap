@@ -1,11 +1,39 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useApi } from '@/lib/api'
+
+const TIMESTAMP_RE = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g
+
+function toSeconds(stamp) {
+  return stamp.split(':').map(Number).reduce((acc, n) => acc * 60 + n, 0)
+}
+
+/** Render an answer, turning [12:34] citations into links that play that moment. */
+function AnswerText({ text, onSeek }) {
+  if (!onSeek) return text
+  const parts = text.split(TIMESTAMP_RE)
+  return parts.map((part, i) =>
+    i % 2 === 1 ? (
+      <button
+        key={i}
+        type="button"
+        onClick={() => onSeek(toSeconds(part))}
+        className="inline-flex items-center gap-0.5 mx-0.5 px-1.5 rounded-md bg-blue-500/10 text-blue-600 dark:text-blue-400 font-medium tabular-nums hover:bg-blue-500/20"
+        title="Play this moment"
+      >
+        <svg className="w-2.5 h-2.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5.14v14l11-7-11-7z" /></svg>
+        {part}
+      </button>
+    ) : part,
+  )
+}
 
 export default function Chat() {
   const api = useApi()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const noteId = searchParams.get('noteId')
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const messagesEndRef = useRef(null)
@@ -16,8 +44,16 @@ export default function Chat() {
     queryFn: () => api.get('/people'),
   })
 
+  const { data: note } = useQuery({
+    queryKey: ['note', noteId],
+    queryFn: () => api.get(`/notes/${noteId}`),
+    enabled: !!noteId,
+  })
+
   const sendMutation = useMutation({
-    mutationFn: (message) => api.post('/insights/chat', { message }),
+    meta: { silent: true }, // errors are shown in the thread
+    mutationFn: ({ message, history }) =>
+      api.post('/insights/chat', { message, history, ...(noteId && { noteId }) }, { timeout: 90000 }),
     onSuccess: (data) => {
       setMessages((prev) => [
         ...prev,
@@ -37,12 +73,12 @@ export default function Chat() {
     if (!trimmed || sendMutation.isPending) return
     setMessages((prev) => [...prev, { role: 'user', content: trimmed }])
     setInput('')
-    sendMutation.mutate(trimmed)
+    sendMutation.mutate({ message: trimmed, history: messages })
   }
 
   const handlePrompt = (prompt) => {
     setMessages((prev) => [...prev, { role: 'user', content: prompt }])
-    sendMutation.mutate(prompt)
+    sendMutation.mutate({ message: prompt, history: messages })
   }
 
   useEffect(() => {
@@ -50,7 +86,12 @@ export default function Chat() {
   }, [messages])
 
   // Generate personalized example prompts based on people data
-  const examplePrompts = (() => {
+  const examplePrompts = noteId ? [
+    'What were the action items and who owns them?',
+    'What decisions were made?',
+    'What questions were left open?',
+    'What were the most important things they said?',
+  ] : (() => {
     const prompts = [
       'What were my key takeaways this week?',
       'What commitments am I behind on?',
@@ -81,7 +122,14 @@ export default function Chat() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
             </svg>
           </button>
-          <h1 className="text-lg font-semibold text-neutral-900 dark:text-white">Ask Recap</h1>
+          <div className="min-w-0">
+            <h1 className="text-lg font-semibold text-neutral-900 dark:text-white">Ask Recap</h1>
+            {noteId && (
+              <p className="text-xs text-neutral-500 dark:text-neutral-400 truncate">
+                About: {note?.title || 'this conversation'}
+              </p>
+            )}
+          </div>
         </div>
       </div>
 
@@ -95,7 +143,7 @@ export default function Chat() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 9.75a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375m-13.5 3.01c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.184-4.183a1.14 1.14 0 01.778-.332 48.294 48.294 0 005.83-.498c1.585-.233 2.708-1.626 2.708-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
                 </svg>
               </div>
-              <h2 className="text-lg font-semibold text-neutral-900 dark:text-white mb-2">Ask Recap anything</h2>
+              <h2 className="text-lg font-semibold text-neutral-900 dark:text-white mb-2">{noteId ? 'Ask about this conversation' : 'Ask Recap anything'}</h2>
               <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-6 text-center max-w-xs">
                 Get insights about your conversations, commitments, and relationships.
               </p>
@@ -126,7 +174,11 @@ export default function Chat() {
                         : 'bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border border-neutral-200 dark:border-neutral-800 rounded-bl-md'
                     }`}
                   >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    <p className="whitespace-pre-wrap">
+                      {msg.role === 'assistant'
+                        ? <AnswerText text={msg.content} onSeek={noteId ? (t) => navigate(`/note/${noteId}?t=${t}`) : null} />
+                        : msg.content}
+                    </p>
                   </div>
                 </div>
               ))}
@@ -157,7 +209,7 @@ export default function Chat() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-              placeholder="Ask about your conversations..."
+                            placeholder={noteId ? 'Ask about this conversation…' : 'Ask about your conversations…'}
               className="flex-1 px-4 py-3 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-sm text-neutral-900 dark:text-white placeholder-neutral-400 outline-none focus:border-blue-500 transition-colors"
             />
             <button

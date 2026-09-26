@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { parseTerms, termsRegExp } from '@/lib/searchTerms'
 import { toast } from '@/lib/toast'
 import { downloadBlob } from '@/lib/uploadRecording'
+import { formatTimestamp } from '@/lib/useNoteAudio'
 
-/** Break a Whisper transcript (one long run of text) into readable paragraphs. */
-function toParagraphs(text) {
+/** Break an untimed transcript (one long run of text) into readable paragraphs. */
+function textParagraphs(text) {
   const explicit = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean)
   if (explicit.length > 1) return explicit
   const sentences = text.match(/[^.!?]+[.!?]+["')\]]*\s*|[^.!?]+$/g) || [text]
@@ -24,28 +25,55 @@ function toParagraphs(text) {
   return paragraphs
 }
 
+/** Group timed segments into paragraphs at pauses or every few sentences. */
+function segmentParagraphs(segments) {
+  const out = []
+  let current = null
+  for (const seg of segments) {
+    const gap = current ? seg.s - current.end : 0
+    const len = current ? current.segs.reduce((n, s) => n + s.t.length, 0) : 0
+    if (!current || gap > 2.5 || current.segs.length >= 6 || len > 550) {
+      current = { start: seg.s, end: seg.e, segs: [] }
+      out.push(current)
+    }
+    current.segs.push(seg)
+    current.end = seg.e
+  }
+  return out
+}
+
 /**
- * Full transcript with find-in-transcript: highlights every match, shows a count,
- * and steps between matches. `initialQuery` pre-fills it (e.g. arriving from search).
+ * Full transcript with:
+ * - find-in-transcript (highlights, count, previous/next)
+ * - when timed segments exist: timestamps, click any sentence to play from there,
+ *   and the sentence being played is highlighted as the audio runs
  */
-export default function TranscriptViewer({ transcript, title, initialQuery = '' }) {
+export default function TranscriptViewer({ transcript, segments, title, initialQuery = '', currentTime = null, onSeek, stickyTop = 57 }) {
   const [query, setQuery] = useState(initialQuery)
   const [active, setActive] = useState(0)
+  const [follow, setFollow] = useState(true)
   const containerRef = useRef(null)
+  const timed = Array.isArray(segments) && segments.length > 0 && !!onSeek
 
-  const paragraphs = useMemo(() => toParagraphs(transcript || ''), [transcript])
   const terms = useMemo(() => parseTerms(query), [query])
   const re = useMemo(() => termsRegExp(terms), [terms])
 
-  // Split each paragraph into text/match segments, numbering matches across the transcript
-  const { rendered, matchCount } = useMemo(() => {
+  // Paragraphs → segments → text/match parts, numbering matches across the transcript
+  const { blocks, matchCount } = useMemo(() => {
     let n = 0
-    const out = paragraphs.map((p) => {
-      if (!re) return [p]
-      return p.split(re).map((part, i) => (i % 2 === 1 ? { match: part, index: n++ } : part))
-    })
-    return { rendered: out, matchCount: n }
-  }, [paragraphs, re])
+    const split = (text) => {
+      if (!re) return [text]
+      return text.split(re).map((part, i) => (i % 2 === 1 ? { match: part, index: n++ } : part))
+    }
+    const source = timed
+      ? segmentParagraphs(segments)
+      : textParagraphs(transcript || '').map((p) => ({ start: null, segs: [{ s: null, e: null, t: p }] }))
+    const out = source.map((p) => ({
+      start: p.start,
+      segs: p.segs.map((seg) => ({ ...seg, parts: split(seg.t) })),
+    }))
+    return { blocks: out, matchCount: n }
+  }, [timed, segments, transcript, re])
 
   const current = matchCount ? Math.min(active, matchCount - 1) : 0
 
@@ -54,6 +82,28 @@ export default function TranscriptViewer({ transcript, title, initialQuery = '' 
     const el = containerRef.current?.querySelector(`[data-match="${current}"]`)
     el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }, [current, matchCount, terms])
+
+  // Which segment is playing right now
+  const playingStart = useMemo(() => {
+    if (!timed || currentTime == null) return null
+    let found = null
+    for (const seg of segments) {
+      if (seg.s <= currentTime + 0.05) found = seg.s
+      else break
+    }
+    return found
+  }, [timed, segments, currentTime])
+
+  // Keep the playing sentence in view (unless the user is searching)
+  useEffect(() => {
+    if (!follow || playingStart == null || terms.length > 0) return
+    const el = containerRef.current?.querySelector(`[data-seg="${playingStart}"]`)
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.top < 120 || rect.bottom > window.innerHeight - 80) {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+  }, [playingStart, follow, terms.length])
 
   const step = (dir) => {
     if (!matchCount) return
@@ -71,15 +121,18 @@ export default function TranscriptViewer({ transcript, title, initialQuery = '' 
 
   const download = () => {
     const safe = (title || 'transcript').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'transcript'
-    downloadBlob(new Blob([transcript], { type: 'text/plain;charset=utf-8' }), `${safe}.txt`)
+    const body = timed
+      ? segmentParagraphs(segments).map((p) => `[${formatTimestamp(p.start)}] ${p.segs.map((s) => s.t).join(' ')}`).join('\n\n')
+      : transcript
+    downloadBlob(new Blob([body], { type: 'text/plain;charset=utf-8' }), `${safe}.txt`)
   }
 
   const words = useMemo(() => (transcript.match(/\S+/g) || []).length, [transcript])
 
   return (
     <div className="bg-white dark:bg-neutral-900 rounded-2xl border border-neutral-200 dark:border-neutral-800 overflow-clip">
-      <div className="sticky top-[57px] z-[5] rounded-t-2xl bg-white/95 dark:bg-neutral-900/95 backdrop-blur border-b border-neutral-100 dark:border-neutral-800 p-2 flex items-center gap-2">
-        <div className="relative flex-1">
+      <div style={{ top: stickyTop }} className="sticky z-[5] rounded-t-2xl bg-white/95 dark:bg-neutral-900/95 backdrop-blur border-b border-neutral-100 dark:border-neutral-800 p-2 flex items-center gap-2">
+        <div className="relative flex-1 min-w-0">
           <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
           </svg>
@@ -118,25 +171,62 @@ export default function TranscriptViewer({ transcript, title, initialQuery = '' 
       </div>
 
       <div ref={containerRef} className="p-4 space-y-4 text-[15px] text-neutral-700 dark:text-neutral-300 leading-relaxed">
-        {rendered.map((segments, pi) => (
-          <p key={pi}>
-            {segments.map((seg, si) =>
-              typeof seg === 'string' ? seg : (
-                <mark
-                  key={si}
-                  data-match={seg.index}
-                  className={`rounded-sm px-0.5 -mx-0.5 text-inherit ${
-                    seg.index === current ? 'bg-orange-400/80 dark:bg-orange-500/60' : 'bg-yellow-300/70 dark:bg-yellow-400/35'
-                  }`}
-                >
-                  {seg.match}
-                </mark>
-              ),
+        {blocks.map((block, bi) => (
+          <div key={bi} className={timed ? 'flex gap-3' : ''}>
+            {timed && (
+              <button
+                type="button"
+                onClick={() => onSeek(block.start)}
+                className="shrink-0 self-start w-12 pt-1 text-left text-xs font-medium tabular-nums text-blue-600 dark:text-blue-400 hover:underline"
+                title="Play from here"
+              >
+                {formatTimestamp(block.start)}
+              </button>
             )}
-          </p>
+            <p className="min-w-0">
+              {block.segs.map((seg, si) => {
+                const content = seg.parts.map((part, pi) =>
+                  typeof part === 'string' ? part : (
+                    <mark
+                      key={pi}
+                      data-match={part.index}
+                      className={`rounded-sm px-0.5 -mx-0.5 text-inherit ${
+                        part.index === current ? 'bg-orange-400/80 dark:bg-orange-500/60' : 'bg-yellow-300/70 dark:bg-yellow-400/35'
+                      }`}
+                    >
+                      {part.match}
+                    </mark>
+                  ),
+                )
+                if (!timed) return <span key={si}>{content}</span>
+                const playing = seg.s === playingStart
+                return (
+                  <span
+                    key={si}
+                    data-seg={seg.s}
+                    onClick={() => onSeek(seg.s)}
+                    title={`Play from ${formatTimestamp(seg.s)}`}
+                    className={`cursor-pointer rounded transition-colors ${
+                      playing ? 'bg-blue-500/15 text-neutral-900 dark:text-white' : 'hover:bg-neutral-100 dark:hover:bg-neutral-800'
+                    }`}
+                  >
+                    {content}{' '}
+                  </span>
+                )
+              })}
+            </p>
+          </div>
         ))}
       </div>
-      <div className="px-4 pb-3 text-xs text-neutral-400">{words.toLocaleString()} words</div>
+      <div className="px-4 pb-3 flex items-center justify-between gap-3 text-xs text-neutral-400">
+        <span>{words.toLocaleString()} words{timed ? ' · click any sentence to play it' : ''}</span>
+        {timed && (
+          <label className="flex items-center gap-1.5 cursor-pointer select-none">
+            <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} className="accent-blue-600" />
+            Follow playback
+          </label>
+        )}
+      </div>
     </div>
   )
 }

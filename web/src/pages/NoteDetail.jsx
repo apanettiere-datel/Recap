@@ -1,8 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useState, useEffect, useRef } from 'react'
-import { useApi, API_BASE } from '@/lib/api'
-import { useAuthFetch } from '@/lib/authFetch'
+import { useApi } from '@/lib/api'
+import { useNoteAudio, findQuoteTime, formatTimestamp } from '@/lib/useNoteAudio'
 import { toast } from '@/lib/toast'
 import { formatFullDate, formatDuration, getInitials, colorForName, sentimentColor } from '@/lib/format'
 import AudioPlayer from '@/components/AudioPlayer'
@@ -11,55 +11,25 @@ import AddToCalendarSheet from '@/components/AddToCalendarSheet'
 import ShareSheet from '@/components/ShareSheet'
 import ProcessingStatus from '@/components/ProcessingStatus'
 import TranscriptViewer from '@/components/TranscriptViewer'
-
-function useNoteAudio(noteId, enabled) {
-  const authFetch = useAuthFetch()
-  const [attempt, setAttempt] = useState(0)
-  // Results are tagged with the request they belong to; anything else reads as "loading"
-  const key = `${noteId}:${attempt}`
-  const [result, setResult] = useState({ key: null, url: null, status: 'idle' })
-
-  useEffect(() => {
-    if (!enabled) return
-    let url = null
-    let cancelled = false
-    const controller = new AbortController()
-    authFetch(`${API_BASE}/api/notes/${noteId}/audio`, { signal: controller.signal })
-      .then((r) => {
-        if (!r.ok) throw new Error(r.status === 404 ? 'missing' : `HTTP ${r.status}`)
-        return r.blob()
-      })
-      .then((blob) => {
-        if (cancelled) return
-        url = URL.createObjectURL(blob)
-        setResult({ key, url, status: 'ready' })
-      })
-      .catch((err) => {
-        if (!cancelled) setResult({ key, url: null, status: err.message === 'missing' ? 'missing' : 'error' })
-      })
-    return () => {
-      cancelled = true
-      controller.abort()
-      if (url) URL.revokeObjectURL(url)
-    }
-  }, [noteId, enabled, key, authFetch])
-
-  const current = result.key === key ? result : { url: null, status: enabled ? 'loading' : 'idle' }
-  return { ...current, retry: () => setAttempt((a) => a + 1) }
-}
+import FollowUpEmail from '@/components/FollowUpEmail'
 
 export default function NoteDetail() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
   const initialQuery = searchParams.get('q') || ''
+  const initialTime = searchParams.has('t') ? Number(searchParams.get('t')) : null
   const navigate = useNavigate()
   const api = useApi()
   const queryClient = useQueryClient()
 
-  const [showTranscript, setShowTranscript] = useState(!!initialQuery)
+  const [showTranscript, setShowTranscript] = useState(!!initialQuery || initialTime != null)
+  const [playTime, setPlayTime] = useState(null)
+  const playerRef = useRef(null)
+  const lastTimeRef = useRef(-1)
   const [calendarCommitment, setCalendarCommitment] = useState(null)
   const [showShare, setShowShare] = useState(false)
   const [showMenu, setShowMenu] = useState(false)
+  const [showFollowUp, setShowFollowUp] = useState(false)
   const [tagInput, setTagInput] = useState('')
   const [showTagInput, setShowTagInput] = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
@@ -72,6 +42,30 @@ export default function NoteDetail() {
   })
 
   const audio = useNoteAudio(id, !!note?.audioUrl)
+
+  // Throttle playback position updates to ~4/s (the player reports every frame)
+  const handleTime = (t) => {
+    if (Math.abs(t - lastTimeRef.current) < 0.25) return
+    lastTimeRef.current = t
+    setPlayTime(t)
+  }
+
+  const seekTo = (seconds) => {
+    if (!playerRef.current) {
+      toast.info(audio.status === 'loading' ? 'Audio is still loading…' : 'Audio isn\'t available for this conversation.')
+      return
+    }
+    playerRef.current.seek(seconds, { play: true })
+    document.getElementById('note-audio')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }
+
+  // Deep link (?t=seconds) from search results, quotes and people pages
+  const deepLinked = useRef(false)
+  useEffect(() => {
+    if (deepLinked.current || initialTime == null || audio.status !== 'ready' || !playerRef.current) return
+    deepLinked.current = true
+    playerRef.current.seek(initialTime, { play: true })
+  }, [audio.status, initialTime])
 
   // When processing finishes, refresh lists that show this note
   const wasProcessing = useRef(false)
@@ -305,9 +299,9 @@ export default function NoteDetail() {
         </div>
 
         {note.audioUrl && (
-          <div className="mb-6">
+          <div id="note-audio" className="mb-6 sticky top-[57px] z-[6] -mx-1 px-1 py-1 bg-neutral-50/90 dark:bg-black/90 backdrop-blur">
             {audio.status === 'ready' ? (
-              <AudioPlayer audioUrl={audio.url} duration={note.duration} />
+              <AudioPlayer ref={playerRef} audioUrl={audio.url} duration={note.duration} onTimeUpdate={handleTime} />
             ) : audio.status === 'loading' ? (
               <div className="h-[72px] rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 flex items-center justify-center gap-2 text-sm text-neutral-400">
                 <div className="w-4 h-4 border-2 border-neutral-300 border-t-transparent rounded-full animate-spin" />
@@ -330,6 +324,23 @@ export default function NoteDetail() {
           <Section title="Summary">
             <p className="text-neutral-800 dark:text-neutral-200 leading-relaxed">{note.summary}</p>
           </Section>
+        )}
+
+        {!note.isProcessing && (note.summary || hasTranscript) && (
+          <div className="flex flex-wrap gap-2 -mt-2 mb-7">
+            <button type="button" onClick={() => setShowFollowUp(true)} className="chip">
+              <svg className="w-4 h-4 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75" />
+              </svg>
+              Draft follow-up email
+            </button>
+            <button type="button" onClick={() => navigate(`/chat?noteId=${id}`)} className="chip">
+              <svg className="w-4 h-4 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM2.25 12.76c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.184-4.183a1.14 1.14 0 01.778-.332 48.294 48.294 0 005.83-.498c1.585-.233 2.708-1.626 2.708-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
+              </svg>
+              Ask about this conversation
+            </button>
+          </div>
         )}
 
         {note.commitments?.length > 0 && (
@@ -372,7 +383,10 @@ export default function NoteDetail() {
               {note.quotes.map((quote, i) => (
                 <blockquote key={quote.id || i} className="border-l-[3px] border-blue-500 pl-4 py-1">
                   <p className="text-[15px] text-neutral-700 dark:text-neutral-300 italic leading-relaxed">&ldquo;{quote.text || quote}&rdquo;</p>
-                  {quote.speaker && <p className="text-xs text-neutral-400 mt-1">&mdash; {quote.speaker}</p>}
+                  <div className="flex items-center gap-3 mt-1">
+                    {quote.speaker && <p className="text-xs text-neutral-400">&mdash; {quote.speaker}</p>}
+                    <QuoteTime quote={quote.text} segments={note.segments} onSeek={seekTo} />
+                  </div>
                 </blockquote>
               ))}
             </div>
@@ -460,7 +474,15 @@ export default function NoteDetail() {
               </span>
             </button>
             {showTranscript ? (
-              <TranscriptViewer transcript={note.transcript} title={note.title} initialQuery={initialQuery} />
+              <TranscriptViewer
+                transcript={note.transcript}
+                segments={note.segments}
+                title={note.title}
+                initialQuery={initialQuery}
+                currentTime={playTime}
+                onSeek={audio.status === 'ready' ? seekTo : undefined}
+                stickyTop={note.audioUrl ? 141 : 57}
+              />
             ) : (
               <button
                 type="button"
@@ -489,7 +511,24 @@ export default function NoteDetail() {
       />
 
       <ShareSheet open={showShare} onClose={() => setShowShare(false)} note={note} />
+      {showFollowUp && <FollowUpEmail noteId={id} onClose={() => setShowFollowUp(false)} />}
     </div>
+  )
+}
+
+function QuoteTime({ quote, segments, onSeek }) {
+  const t = findQuoteTime(quote, segments)
+  if (t == null) return null
+  return (
+    <button
+      type="button"
+      onClick={() => onSeek(t)}
+      className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+      title="Play this moment"
+    >
+      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5.14v14l11-7-11-7z" /></svg>
+      {formatTimestamp(t)}
+    </button>
   )
 }
 

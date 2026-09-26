@@ -1,11 +1,12 @@
 import { formatRelativeDate, formatDuration, getInitials, colorForName, sentimentColor } from '@/lib/format'
 import { Highlight } from '@/lib/highlight'
+import { formatTimestamp } from '@/lib/useNoteAudio'
 
 /**
  * A conversation in a list. With `terms`, matches are highlighted and transcript
  * snippets from search results are shown.
  */
-export default function NoteCard({ note, onClick, onRetry, terms }) {
+export default function NoteCard({ note, onClick, onRetry, onOpenAt, terms }) {
   const people = (note.people || []).filter((p) => p.relationship !== 'organization')
   const failed = !note.isProcessing && !!note.processingError
   const openCommitments = (note.commitments || []).filter((c) => c.status !== 'completed').length
@@ -60,7 +61,32 @@ export default function NoteCard({ note, onClick, onRetry, terms }) {
         </p>
       ) : null}
 
-      {note.snippets?.length > 0 && (
+      {note.hits?.length > 0 && onOpenAt ? (
+        <div className="mt-2 mb-2 space-y-1">
+          {note.hits.slice(0, 3).map((hit, i) => (
+            <button
+              key={i}
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onOpenAt(hit.start) }}
+              className="w-full flex items-start gap-2 text-left rounded-lg px-2 py-1.5 -mx-2 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              title="Play from this moment"
+            >
+              <span className="shrink-0 inline-flex items-center gap-1 text-xs font-medium tabular-nums text-blue-600 dark:text-blue-400 pt-0.5">
+                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5.14v14l11-7-11-7z" /></svg>
+                {formatTimestamp(hit.start)}
+              </span>
+              <span className="text-[13px] text-neutral-600 dark:text-neutral-400 leading-relaxed line-clamp-2">
+                <Highlight text={hit.text} terms={terms} />
+              </span>
+            </button>
+          ))}
+          {note.transcriptMatches > note.hits.length && (
+            <p className="text-xs text-neutral-400 dark:text-neutral-500">
+              {note.transcriptMatches} matches in transcript
+            </p>
+          )}
+        </div>
+      ) : note.snippets?.length > 0 && (
         <div className="mt-2 mb-2 space-y-1.5">
           {note.snippets.slice(0, 2).map((s, i) => (
             <p key={i} className="text-[13px] text-neutral-600 dark:text-neutral-400 leading-relaxed pl-3 border-l-2 border-yellow-400/70">

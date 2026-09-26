@@ -2,15 +2,17 @@ import { Hono } from "hono";
 import { db } from "../services/db.js";
 import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
 import { eq, and, desc, ilike, or, sql, inArray, gte, lte, getTableColumns, type SQL } from "drizzle-orm";
-import { enqueueNote, isNoteQueued } from "../services/processing.js";
+import { enqueueNote, isNoteQueued, draftFollowUp } from "../services/processing.js";
 import { sniffAudioFormat } from "../services/audio.js";
-import { writeFile, mkdir, readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { AppEnv } from "../types.js";
+import { ingestAudioFile, writeTempUpload, IngestError, MIN_AUDIO_BYTES, CLIENT_ID_RE } from "../services/ingest.js";
 
-const UPLOADS_DIR = join(import.meta.dirname, "../../uploads");
-const MIN_AUDIO_BYTES = 1024;
+export function parseRecordedAt(v: unknown): Date {
+  const d = typeof v === "string" ? new Date(v) : null;
+  return d && !Number.isNaN(d.getTime()) && d.getTime() <= Date.now() + 60_000 ? d : new Date();
+}
 
 const app = new Hono<AppEnv>();
 
@@ -68,7 +70,7 @@ async function withRelations<T extends { id: string }>(rows: T[]) {
 }
 
 // List payloads skip the transcript (it can be ~100KB for a long recording)
-const { transcript: _transcript, ...listColumns } = getTableColumns(notes);
+const { transcript: _transcript, segments: _segments, ...listColumns } = getTableColumns(notes);
 const listSelection = {
   ...listColumns,
   transcriptLength: sql<number>`length(${notes.transcript})`.mapWith(Number),
@@ -84,8 +86,8 @@ function parseOffset(value: string | undefined) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-function extensionFor(file: File, header: Uint8Array): string {
-  const type = (file.type || "").toLowerCase();
+export function extensionFor(file: { type?: string } | string, header: Uint8Array): string {
+  const type = (typeof file === "string" ? file : file.type || "").toLowerCase();
   if (type.includes("webm")) return "webm";
   if (type.includes("ogg")) return "ogg";
   if (type.includes("mp4") || type.includes("m4a") || type.includes("aac")) return "m4a";
@@ -107,79 +109,31 @@ app.post("/", async (c) => {
   }
 
   const audio = body["audio"];
-  const mode = typeof body["mode"] === "string" && body["mode"] ? body["mode"] : "general";
-  const personId = typeof body["personId"] === "string" && body["personId"] ? body["personId"] : null;
-  const duration = Math.max(0, parseFloat((body["duration"] as string) || "0") || 0);
-  const clientId = typeof body["clientId"] === "string" && /^[A-Za-z0-9-]{8,64}$/.test(body["clientId"]) ? body["clientId"] : null;
-  const recordedAtRaw = typeof body["recordedAt"] === "string" ? new Date(body["recordedAt"]) : null;
-  const recordedAt = recordedAtRaw && !Number.isNaN(recordedAtRaw.getTime()) && recordedAtRaw.getTime() <= Date.now() + 60_000
-    ? recordedAtRaw
-    : new Date();
-
   if (!audio || typeof audio === "string") return c.json({ error: "No audio file was included in the upload." }, 400);
   if (audio.size < MIN_AUDIO_BYTES) return c.json({ error: "The recording is empty — no audio was captured." }, 400);
 
-  // Idempotency: a retried upload (e.g. the response was lost) returns the original note
-  if (clientId) {
-    const [existing] = await db
-      .select({ id: notes.id, isProcessing: notes.isProcessing })
-      .from(notes)
-      .where(and(eq(notes.userId, userId), sql`${notes.audioUrl} like ${`%/${userId}_${clientId}.%`}`))
-      .limit(1);
-    if (existing) {
-      return c.json({ id: existing.id, status: existing.isProcessing ? "processing" : "done", duplicate: true }, 200);
-    }
-  }
-
-  if (personId) {
-    const [owned] = await db
-      .select({ id: people.id })
-      .from(people)
-      .where(and(eq(people.id, personId), eq(people.userId, userId)))
-      .limit(1);
-    if (!owned) return c.json({ error: "That person was not found." }, 400);
-  }
-
+  const clientId = typeof body["clientId"] === "string" && CLIENT_ID_RE.test(body["clientId"]) ? body["clientId"] : null;
   const buffer = Buffer.from(await audio.arrayBuffer());
-  const ext = extensionFor(audio, buffer.subarray(0, 16));
-  const filename = `${userId}_${clientId ?? Date.now()}.${ext}`;
-  const filePath = join(UPLOADS_DIR, filename);
 
   try {
-    await mkdir(UPLOADS_DIR, { recursive: true });
-    await writeFile(filePath, buffer);
-  } catch (err) {
-    console.error("[upload] failed to save audio:", err);
-    return c.json({ error: "The server couldn't save your recording. Please retry." }, 507);
-  }
-
-  let note: NoteRow;
-  try {
-    [note] = await db
-      .insert(notes)
-      .values({
-        userId,
-        audioUrl: `file://${filePath}`,
-        duration,
-        conversationMode: mode,
-        recordedAt,
-        isProcessing: true,
-      })
-      .returning();
-
-    if (personId) {
-      await db.insert(notePeople).values({ noteId: note.id, personId });
-      await db.update(people).set({ lastContactDate: recordedAt }).where(eq(people.id, personId));
+    const tempPath = await writeTempUpload(buffer);
+    const result = await ingestAudioFile(tempPath, {
+      userId,
+      clientId,
+      ext: extensionFor(audio, buffer.subarray(0, 16)),
+      mode: typeof body["mode"] === "string" && body["mode"] ? body["mode"] : "general",
+      duration: Math.max(0, parseFloat((body["duration"] as string) || "0") || 0),
+      personId: typeof body["personId"] === "string" && body["personId"] ? body["personId"] : null,
+      recordedAt: parseRecordedAt(body["recordedAt"]),
+    });
+    if (result.status === "duplicate") {
+      return c.json({ id: result.id, status: result.processing ? "processing" : "done", duplicate: true }, 200);
     }
+    return c.json({ id: result.id, status: "processing" }, result.status === "created" ? 201 : 200);
   } catch (err) {
-    console.error("[upload] failed to create note:", err);
-    await unlink(filePath).catch(() => {});
-    return c.json({ error: "The server couldn't save your recording. Please retry." }, 500);
+    if (err instanceof IngestError) return c.json({ error: err.message }, err.httpStatus);
+    throw err;
   }
-
-  enqueueNote(note.id, userId);
-
-  return c.json({ id: note.id, status: "processing" }, 201);
 });
 
 // Create text note (no audio)
@@ -392,10 +346,12 @@ async function searchNotes(userId: string, q: string, opts: {
     }
     if (lowerTerms.length > 1 && transcript.includes(lowerTerms.join(" "))) score += 5;
 
-    const { transcript: fullTranscript, ...rest } = note;
+    const { transcript: fullTranscript, segments, ...rest } = note;
     return {
       note: {
         ...rest,
+        // Timestamped matches, so a result can open the audio at that moment
+        hits: transcriptMatches > 0 ? segmentHits(segments ?? [], lowerTerms) : [],
         transcriptLength: fullTranscript.length,
         matchedIn: [...matchedIn],
         transcriptMatches,
@@ -438,6 +394,18 @@ async function searchNotes(userId: string, q: string, opts: {
     people: matchingPeople,
     commitments: matchingCommitments,
   };
+}
+
+function segmentHits(segments: { s: number; e: number; t: string }[], lowerTerms: string[], max = 3) {
+  const hits: { start: number; text: string }[] = [];
+  for (const seg of segments) {
+    const t = seg.t.toLowerCase();
+    if (lowerTerms.some((term) => t.includes(term))) {
+      hits.push({ start: seg.s, text: seg.t });
+      if (hits.length >= max) break;
+    }
+  }
+  return hits;
 }
 
 function parseDateParam(v: string | undefined) {
@@ -572,6 +540,47 @@ app.post("/:id/reprocess", async (c) => {
   enqueueNote(noteId, userId, { retranscribe: !!body?.retranscribe });
 
   return c.json({ id: noteId, status: "processing" });
+});
+
+// Draft a follow-up email: POST /notes/:id/follow-up { tone? }
+app.post("/:id/follow-up", async (c) => {
+  const userId = c.get("userId") as string;
+  const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const body = await c.req.json<{ tone?: string }>().catch(() => ({} as { tone?: string }));
+
+  const [note] = await db.select().from(notes).where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  if (!note) return c.json({ error: "Not found" }, 404);
+  if (note.isProcessing) return c.json({ error: "Wait for processing to finish first." }, 409);
+  if (!note.summary.trim() && !note.transcript.trim()) return c.json({ error: "There's nothing in this conversation to follow up on yet." }, 400);
+
+  const [withRel] = await withRelations([note]);
+  const humans = withRel.people.filter((p) => p.relationship !== "organization");
+  const nameById = new Map(withRel.people.map((p) => [p.id, p.name]));
+
+  try {
+    const draft = await draftFollowUp({
+      title: note.title,
+      summary: note.summary,
+      transcript: note.transcript,
+      recipients: humans.map((p) => p.name),
+      commitments: withRel.commitments.map((cm) => ({
+        description: cm.description,
+        owner: cm.owner,
+        dueDate: cm.dueDate,
+        person: cm.personId ? nameById.get(cm.personId) ?? null : null,
+      })),
+      tone: typeof body?.tone === "string" ? body.tone.slice(0, 60) : undefined,
+    });
+    return c.json({
+      ...draft,
+      to: humans.filter((p) => p.email).map((p) => ({ name: p.name, email: p.email })),
+      missingEmails: humans.filter((p) => !p.email).map((p) => ({ id: p.id, name: p.name })),
+    });
+  } catch (err) {
+    console.error("[follow-up] draft failed:", err);
+    return c.json({ error: (err as Error).message?.startsWith("The draft") ? (err as Error).message : "Couldn't draft the email right now. Please try again." }, 502);
+  }
 });
 
 // Delete note (and its audio file)

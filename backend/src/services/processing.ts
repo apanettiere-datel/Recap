@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { db } from "./db.js";
-import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
+import { notes, commitments, topics, people, notePeople, quotes, tags, type TranscriptSegment } from "../models/schema.js";
 import { eq, and, lt, sql } from "drizzle-orm";
 import { generateInsights } from "./insights.js";
-import { hasFfmpeg, normalizeAndSplit, sniffAudioFormat, AudioDecodeError } from "./audio.js";
+import { hasFfmpeg, normalizeAndSplit, sniffAudioFormat, AudioDecodeError, CHUNK_DURATION_SECS } from "./audio.js";
 
 const WHISPER_MAX_BYTES = 24 * 1024 * 1024; // 24MB (Whisper limit is 25MB)
 const MAX_CONCURRENT_NOTES = 2;
@@ -186,7 +186,10 @@ export async function processNote(noteId: string, userId: string, opts: { retran
       const result = await transcribeAudio(note.audioUrl, (stage) => setStage(noteId, stage));
       transcript = result.transcript;
 
-      const updates: Partial<typeof notes.$inferInsert> = { transcript };
+      const updates: Partial<typeof notes.$inferInsert> = {
+        transcript,
+        segments: result.segments.length > 0 ? result.segments : null,
+      };
       // Recovered or interrupted recordings may not know their duration — trust the decoder
       if (result.durationSecs && (!note.duration || Math.abs(note.duration - result.durationSecs) > 5)) {
         updates.duration = Math.round(result.durationSecs);
@@ -267,7 +270,22 @@ function describeError(error: unknown): string {
 
 interface TranscriptionResult {
   transcript: string;
+  segments: TranscriptSegment[];
   durationSecs: number | null;
+}
+
+interface FileTranscript {
+  text: string;
+  segments: TranscriptSegment[];
+}
+
+/** Shift a chunk's segment times by where that chunk starts in the whole recording. */
+function offsetSegments(segments: TranscriptSegment[], offset: number): TranscriptSegment[] {
+  return segments.map((s) => ({ s: round2(s.s + offset), e: round2(s.e + offset), t: s.t }));
+}
+
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
 }
 
 async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Promise<void>): Promise<TranscriptionResult> {
@@ -287,12 +305,14 @@ async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Pro
     if (size < 1024) throw new ProcessingError("The recording is empty — no audio was captured.");
 
     let chunkPaths: string[] | null = null;
+    let chunkDurations: (number | null)[] = [];
     let durationSecs: number | null = null;
 
     if (await hasFfmpeg()) {
       try {
         const prepared = await normalizeAndSplit(filePath, workDir);
         chunkPaths = prepared.chunkPaths;
+        chunkDurations = prepared.chunkDurations;
         durationSecs = prepared.durationSecs;
       } catch (err) {
         // Fall through to sending the original file, Whisper may still accept it
@@ -308,8 +328,16 @@ async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Pro
       await onStage("Transcribing audio");
       const header = await readHeader(filePath);
       const { ext, mime } = sniffAudioFormat(header);
-      const transcript = await transcribeFile(filePath, `audio.${ext}`, mime);
-      return { transcript: cleanTranscript(transcript), durationSecs };
+      const result = cleanFileTranscript(await transcribeFile(filePath, `audio.${ext}`, mime));
+      return { transcript: result.text, segments: result.segments, durationSecs };
+    }
+
+    // Where each chunk starts, from measured durations (fall back to the nominal length)
+    const offsets: number[] = [];
+    let acc = 0;
+    for (let i = 0; i < chunkPaths.length; i++) {
+      offsets.push(acc);
+      acc += chunkDurationsOrNominal(chunkDurations, i);
     }
 
     const total = chunkPaths.length;
@@ -319,17 +347,21 @@ async function transcribeAudio(audioUrl: string, onStage: (stage: string) => Pro
     let done = 0;
     const results = await mapWithConcurrency(chunkPaths, CHUNK_TRANSCRIBE_CONCURRENCY, async (path, i) => {
       try {
-        const text = await transcribeFile(path, `chunk_${i}.mp3`, "audio/mpeg");
+        const result = cleanFileTranscript(await transcribeFile(path, `chunk_${i}.mp3`, "audio/mpeg"));
         done++;
         if (total > 1) await onStage(`Transcribing audio (${done} of ${total})`);
-        return cleanTranscript(text);
+        return { text: result.text, segments: offsetSegments(result.segments, offsets[i]) };
       } catch (err) {
         if (total > 1 && err instanceof Error) err.message = `part ${i + 1} of ${total}: ${err.message}`;
         throw err;
       }
     });
 
-    return { transcript: results.filter(Boolean).join(" ").trim(), durationSecs };
+    return {
+      transcript: results.map((r) => r.text).filter(Boolean).join(" ").trim(),
+      segments: results.flatMap((r) => r.segments),
+      durationSecs,
+    };
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -346,17 +378,37 @@ async function readHeader(filePath: string): Promise<Uint8Array> {
   }
 }
 
-async function transcribeFile(filePath: string, filename: string, mime: string): Promise<string> {
+function chunkDurationsOrNominal(durations: (number | null)[], i: number) {
+  return durations[i] ?? CHUNK_DURATION_SECS;
+}
+
+interface WhisperSegment {
+  start: number;
+  end: number;
+  text: string;
+  no_speech_prob?: number;
+  avg_logprob?: number;
+}
+
+async function transcribeFile(filePath: string, filename: string, mime: string): Promise<FileTranscript> {
   const data = await readFile(filePath);
   // The SDK's own retries re-send an already-consumed multipart stream and hang, so
   // retry here with a fresh File each attempt instead.
   return withRetry(`transcribe ${filename}`, async () => {
     const file = new File([data], filename, { type: mime });
-    const transcription = await getOpenAI().audio.transcriptions.create(
-      { model: "whisper-1", file, response_format: "text" },
+    const res = await getOpenAI().audio.transcriptions.create(
+      { model: "whisper-1", file, response_format: "verbose_json", timestamp_granularities: ["segment"] },
       { maxRetries: 0 },
-    );
-    return typeof transcription === "string" ? transcription : String((transcription as { text?: string }).text ?? "");
+    ) as unknown as { text?: string; segments?: WhisperSegment[] } | string;
+
+    if (typeof res === "string") return { text: res, segments: [] };
+    const segments = (res.segments ?? [])
+      // Whisper's own "this was silence" signal — drops hallucinated filler on quiet audio
+      .filter((s) => !((s.no_speech_prob ?? 0) > 0.6 && (s.avg_logprob ?? 0) < -1))
+      .map((s) => ({ s: round2(Number(s.start) || 0), e: round2(Number(s.end) || 0), t: String(s.text ?? "").trim() }))
+      .filter((s) => s.t);
+    const text = segments.length > 0 || res.segments ? segments.map((s) => s.t).join(" ") : String(res.text ?? "");
+    return { text, segments };
   });
 }
 
@@ -390,10 +442,10 @@ const SILENCE_HALLUCINATIONS = [
   /^(please )?(like and )?subscribe[.!]*$/i,
 ];
 
-function cleanTranscript(text: string): string {
-  const t = (text || "").trim();
-  if (t.length < 40 && SILENCE_HALLUCINATIONS.some((re) => re.test(t))) return "";
-  return t;
+function cleanFileTranscript(result: FileTranscript): FileTranscript {
+  const t = (result.text || "").trim();
+  if (t.length < 40 && SILENCE_HALLUCINATIONS.some((re) => re.test(t))) return { text: "", segments: [] };
+  return { text: t, segments: result.segments };
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -418,6 +470,44 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T,
 // ---------------------------------------------------------------------------
 // Analysis
 // ---------------------------------------------------------------------------
+
+/** Draft a follow-up email after a conversation. */
+export async function draftFollowUp(input: {
+  title: string;
+  summary: string;
+  transcript: string;
+  recipients: string[];
+  commitments: { description: string; owner: string; dueDate: Date | null; person: string | null }[];
+  tone?: string;
+}): Promise<{ subject: string; body: string }> {
+  const commitmentsText = input.commitments.length
+    ? input.commitments.map((c) => `- ${c.owner === "me" ? "I" : c.person || "They"} will ${c.description}${c.dueDate ? ` (by ${c.dueDate.toISOString().split("T")[0]})` : ""}`).join("\n")
+    : "None recorded.";
+  const raw = await chatJSON(
+    "You write concise, natural follow-up emails after a conversation, in the first person as the person who recorded it. Respond with valid JSON.",
+    `Write a follow-up email to ${input.recipients.length ? input.recipients.join(", ") : "the other people in the conversation"}.
+Tone: ${input.tone || "friendly and professional"}.
+
+Return JSON: { "subject": "short subject line", "body": "email body with greeting and sign-off placeholder [Your name]" }
+
+Rules:
+- Thank them briefly, recap the key points in 2-4 short bullet lines, and list agreed next steps with owners and dates.
+- Only include facts from the conversation below. Never invent dates, numbers or promises.
+- Keep it under 180 words. Plain text, no markdown headings.
+
+Conversation: ${input.title}
+Summary: ${input.summary}
+Commitments:
+${commitmentsText}
+
+Transcript excerpt:
+${input.transcript.slice(0, 12000)}`,
+  );
+  const subject = str(raw.subject, 200) || `Follow-up: ${input.title}`;
+  const body = str(raw.body, 5000);
+  if (!body) throw new ProcessingError("The draft came back empty. Please try again.");
+  return { subject, body };
+}
 
 async function chatJSON(system: string, user: string): Promise<Record<string, unknown>> {
   let lastError: unknown;

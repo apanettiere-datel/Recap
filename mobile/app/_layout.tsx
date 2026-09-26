@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { AppState } from 'react-native';
 import { Stack, router } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -8,6 +9,7 @@ import { useAuthStore } from '../stores/auth';
 import { useTheme } from '../lib/useTheme';
 import { useCommitmentReminders } from '../hooks/useCommitmentReminders';
 import '../lib/notifications';
+import { processQueue } from '../lib/recordingQueue';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,6 +26,18 @@ function AppContent() {
   useEffect(() => {
     useAuthStore.getState().setLoading(false);
   }, []);
+
+  // Upload any recordings saved on the phone that haven't reached the server yet
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    processQueue().then(() => queryClient.invalidateQueries({ queryKey: ['notes'] })).catch(() => {});
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        processQueue().then(() => queryClient.invalidateQueries({ queryKey: ['notes'] })).catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, [isAuthenticated]);
 
   useEffect(() => {
     const subscription = Notifications.addNotificationResponseReceivedListener(response => {

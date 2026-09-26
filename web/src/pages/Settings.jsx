@@ -1,5 +1,7 @@
 import { useTheme } from '@/lib/theme'
-import { useApi } from '@/lib/api'
+import { useApi, API_BASE } from '@/lib/api'
+import { toast } from '@/lib/toast'
+import WeeklyEmailSettings from '@/components/WeeklyEmailSettings'
 import { useAuthFetch } from '@/lib/authFetch'
 import { useState } from 'react'
 import { useClerk } from '@clerk/clerk-react'
@@ -34,7 +36,7 @@ export default function Settings() {
     setExporting(type)
     try {
       const path = type === 'contacts' ? '/api/people/export' : '/api/commitments/export'
-      const r = await authFetch(path)
+      const r = await authFetch(`${API_BASE}${path}`)
       if (!r.ok) throw new Error(`Export failed: ${r.status}`)
       const text = await r.text()
       const blob = new Blob([text], { type: 'text/csv' })
@@ -48,6 +50,7 @@ export default function Settings() {
       URL.revokeObjectURL(url)
     } catch (e) {
       console.error('Export failed:', e)
+      toast.error("Couldn't export. Check your connection and try again.")
     }
     setExporting(null)
   }
@@ -102,6 +105,14 @@ export default function Settings() {
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Weekly email */}
+        <div>
+          <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+            Email
+          </h2>
+          <WeeklyEmailSettings />
         </div>
 
         {/* Export Data */}

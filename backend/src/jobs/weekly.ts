@@ -1,7 +1,35 @@
 import cron from "node-cron";
+import { eq } from "drizzle-orm";
 import { db } from "../services/db.js";
 import { users } from "../models/schema.js";
 import { generateWeeklyReport, generateInsights } from "../services/insights.js";
+import { buildDigest, localDayHour } from "../services/digest.js";
+import { sendEmail, isEmailConfigured } from "../services/email.js";
+
+/**
+ * Send weekly summaries that are due. Each user picks a weekday and hour in their own
+ * timezone; a missed hour (server down, provider error) is caught up later that day,
+ * and a user never gets more than one summary in 6 days.
+ */
+export async function sendDueDigests(now = new Date()) {
+  if (!isEmailConfigured()) return;
+  const subscribers = await db.select().from(users).where(eq(users.digestEnabled, true));
+  for (const user of subscribers) {
+    const to = user.digestEmail || user.email;
+    if (!to) continue;
+    const { day, hour } = localDayHour(now, user.timezone || "UTC");
+    if (day !== user.digestDay || hour < user.digestHour) continue;
+    if (user.lastDigestSentAt && now.getTime() - user.lastDigestSentAt.getTime() < 6 * 86400000) continue;
+    try {
+      const digest = await buildDigest(user.id, now);
+      await sendEmail({ to, subject: digest.subject, html: digest.html, text: digest.text });
+      await db.update(users).set({ lastDigestSentAt: now }).where(eq(users.id, user.id));
+      console.log(`[digest] sent weekly summary to user ${user.id}`);
+    } catch (err) {
+      console.error(`[digest] failed for user ${user.id} (will retry next hour):`, err);
+    }
+  }
+}
 
 export function startWeeklyJobs() {
   // Generate weekly reports every Sunday at 6 PM
@@ -39,6 +67,12 @@ export function startWeeklyJobs() {
     }
   });
 
+  // Weekly email summaries: check hourly, each user on their own schedule
+  cron.schedule("7 * * * *", () => {
+    sendDueDigests().catch((err) => console.error("[cron] Digest job failed:", err));
+  });
+
+  console.log("[cron] Weekly email summaries: hourly check");
   console.log("[cron] Weekly report: Sundays 6 PM");
   console.log("[cron] Daily insights: Daily 8 AM");
 }

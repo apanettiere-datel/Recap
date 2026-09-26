@@ -7,11 +7,12 @@ const DEFAULT_TIMEOUT_MS = 30000
 
 /** An API failure with the HTTP status and the server's own error message when available. */
 export class ApiError extends Error {
-  constructor(message, { status = 0, network = false } = {}) {
+  constructor(message, { status = 0, network = false, data = null } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.network = network
+    this.data = data
   }
 
   /** Worth retrying: network trouble, timeouts, rate limits and server errors. */
@@ -36,10 +37,12 @@ const STATUS_MESSAGES = {
 
 async function errorFromResponse(r) {
   let message = ''
+  let data = null
   try {
     const text = await r.text()
     try {
-      message = JSON.parse(text)?.error || ''
+      data = JSON.parse(text)
+      message = data?.error || ''
     } catch {
       // Proxies (nginx) return HTML error pages; don't show those
       if (text && text.length < 200 && !text.trim().startsWith('<')) message = text.trim()
@@ -47,7 +50,7 @@ async function errorFromResponse(r) {
   } catch {
     // body unreadable
   }
-  return new ApiError(message || STATUS_MESSAGES[r.status] || `Request failed (${r.status})`, { status: r.status })
+  return new ApiError(message || STATUS_MESSAGES[r.status] || `Request failed (${r.status})`, { status: r.status, data })
 }
 
 function toNetworkError(err) {
@@ -63,7 +66,7 @@ function toNetworkError(err) {
     : "Couldn't reach the server. Check your connection and try again.", { network: true })
 }
 
-async function request(authFetch, path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT_MS, signal } = {}) {
+async function request(authFetch, path, { method = 'GET', body, raw, timeout = DEFAULT_TIMEOUT_MS, signal } = {}) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeout)
   const onAbort = () => controller.abort()
@@ -77,6 +80,10 @@ async function request(authFetch, path, { method = 'GET', body, timeout = DEFAUL
       ...(body !== undefined && {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+      }),
+      ...(raw !== undefined && {
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: raw,
       }),
     })
   } catch (err) {
@@ -130,5 +137,6 @@ export function useApi() {
     patch: (path, body, opts) => request(authFetch, path, { ...opts, method: 'PATCH', body }),
     del: (path, opts) => request(authFetch, path, { ...opts, method: 'DELETE' }),
     upload: (path, formData, opts) => uploadWithProgress(getHeaders, path, formData, opts),
+    putRaw: (path, blob, opts) => request(authFetch, path, { timeout: 120000, ...opts, method: 'PUT', raw: blob }),
   }), [authFetch, getHeaders])
 }

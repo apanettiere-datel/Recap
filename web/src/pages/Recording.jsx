@@ -9,6 +9,8 @@ import {
   notifyRecordingsChanged, markUploading, unmarkUploading,
 } from '@/lib/recordingStore'
 import { uploadRecording, downloadBlob, extensionForMime } from '@/lib/uploadRecording'
+import { LiveUploader } from '@/lib/liveUploader'
+import PendingRecordings from '@/components/PendingRecordings'
 
 const MAX_RECORDING_SECONDS = 2 * 60 * 60 // 2 hours
 const LIMIT_WARNING_SECONDS = MAX_RECORDING_SECONDS - 5 * 60
@@ -53,6 +55,8 @@ export default function Recording() {
   const [notice, setNotice] = useState(null)
   const [silent, setSilent] = useState(false)
   const [backupOk, setBackupOk] = useState(true)
+  const [cloud, setCloud] = useState(null)
+  const [importing, setImporting] = useState(false)
   const [upload, setUpload] = useState({ progress: 0, attempt: 0, size: 0 })
 
   const recorderRef = useRef(null)
@@ -73,6 +77,7 @@ export default function Recording() {
   const mountedRef = useRef(true)
   const phaseRef = useRef('choose')
   const limitWarnedRef = useRef(false)
+  const liveRef = useRef(null)
 
   const go = (p) => { phaseRef.current = p; setPhase(p) }
 
@@ -243,11 +248,16 @@ export default function Recording() {
       setBackupOk(false)
     }
 
+    // Second copy: stream the audio to the server while recording
+    setCloud(null)
+    liveRef.current = new LiveUploader(api, session, (st) => { if (mountedRef.current) setCloud(st) })
+
     recorder.ondataavailable = (e) => {
       if (!e.data || e.data.size === 0 || discardRef.current) return
       chunksRef.current.push(e.data)
       const seq = seqRef.current++
       appendChunk(session.id, seq, e.data, elapsedMs() / 1000).catch(() => setBackupOk(false))
+      liveRef.current?.add(e.data, elapsedMs() / 1000)
     }
     recorder.onstop = () => onRecorderStopped()
     recorder.onerror = (e) => {
@@ -273,6 +283,8 @@ export default function Recording() {
       setError(`Couldn't start the recorder${err?.message ? ` (${err.message})` : ''}.`)
       go('error')
       deleteSession(session.id).catch(() => {})
+      liveRef.current?.discard()
+      liveRef.current = null
       return
     }
 
@@ -365,6 +377,8 @@ export default function Recording() {
 
     if (blob.size === 0 || durationSec < MIN_RECORDING_SECONDS) {
       deleteSession(session.id).catch(() => {})
+      liveRef.current?.discard()
+      liveRef.current = null
       notifyRecordingsChanged()
       if (!mountedRef.current) return
       setError('That recording was too short or captured no audio. Check your microphone and try again.')
@@ -389,7 +403,22 @@ export default function Recording() {
     markUploading(session.id)
 
     try {
-      const note = await uploadRecording(api, {
+      // Fast path: most of the audio is already on the server; send the tail and finalize
+      let note = null
+      const live = liveRef.current
+      liveRef.current = null
+      if (live) {
+        try {
+          note = await live.finish(durationSec, {
+            onProgress: (p) => mountedRef.current && setUpload((u) => ({ ...u, progress: p })),
+          })
+        } catch (err) {
+          console.warn('[recording] live upload could not finish, uploading the full file:', err?.message)
+          live.close()
+        }
+      }
+
+      if (!note?.id) note = await uploadRecording(api, {
         blob,
         clientId: session.id,
         mode: 'conversation',
@@ -432,6 +461,8 @@ export default function Recording() {
 
     discardRef.current = true
     finalizedRef.current = true
+    liveRef.current?.discard()
+    liveRef.current = null
     const r = recorderRef.current
     if (r && r.state !== 'inactive') {
       r.onstop = null
@@ -443,6 +474,32 @@ export default function Recording() {
       notifyRecordingsChanged()
     }
     navigate('/', { replace: true })
+  }
+
+  /** Import an existing recording (voice memo, meeting export, etc.). */
+  async function importFile(file) {
+    if (!file) return
+    if (!/^(audio|video)\//.test(file.type) && !/\.(m4a|mp3|wav|webm|ogg|aac|mp4|mov|flac)$/i.test(file.name)) {
+      toast.error("That doesn't look like an audio file.")
+      return
+    }
+    if (file.size > 250 * 1024 * 1024) {
+      toast.error('That file is larger than 250MB. Trim it or split it into parts first.')
+      return
+    }
+    const session = {
+      id: newSessionId(),
+      mimeType: file.type || 'audio/mp4',
+      mode: 'import',
+      personId: personId || null,
+      startedAt: new Date(file.lastModified || Date.now()).toISOString(),
+    }
+    sessionRef.current = session
+    blobRef.current = file
+    accumulatedMsRef.current = 0
+    setImporting(true)
+    setMode('voice')
+    await doUpload()
   }
 
   function saveForLater() {
@@ -473,6 +530,8 @@ export default function Recording() {
       const r = recorderRef.current
       if (r && r.state === 'recording') {
         try { r.requestData() } catch { /* ignore */ }
+        // Push the newest audio to the cloud too, once the requested chunk arrives
+        setTimeout(() => liveRef.current?.flush(), 100)
       }
     }
     const onVisibility = () => {
@@ -498,19 +557,31 @@ export default function Recording() {
       if (r && r.state !== 'inactive' && !finalizedRef.current) {
         finalizedRef.current = true
         const session = sessionRef.current
+        const live = liveRef.current
+        const duration = Math.round(elapsedMs() / 1000)
         r.onstop = () => {
-          if (session && !discardRef.current) {
-            updateSession(session.id, { status: 'stopped', duration: Math.round(elapsedMs() / 1000) })
-              .catch(() => {})
-              .finally(notifyRecordingsChanged)
-          }
+          if (!session || discardRef.current) return
+          updateSession(session.id, { status: 'stopped', duration })
+            .catch(() => {})
+            .finally(notifyRecordingsChanged)
+          if (!live) return
+          // Keep finishing the upload in the background
+          markUploading(session.id)
+          live.finish(duration)
+            .then(async () => {
+              await deleteSession(session.id).catch(() => {})
+              queryClient.invalidateQueries({ queryKey: ['notes'] })
+              toast.success('Your recording was saved and is being processed.')
+            })
+            .catch(() => toast.info('Recording saved on this device — upload it from the banner.'))
+            .finally(() => { unmarkUploading(session.id); notifyRecordingsChanged() })
         }
         try { r.stop() } catch { /* ignore */ }
-        toast.info('Recording stopped. It was saved on this device — upload it from the banner.')
+        toast.info('Recording stopped and saved.')
       }
       releaseMedia()
     }
-  }, [])
+  }, [queryClient])
 
   // ---------------------------------------------------------------------------
   // Render
@@ -523,6 +594,9 @@ export default function Recording() {
       <Screen>
         <TopBar onCancel={() => navigate(-1)} />
         <div className="w-full max-w-sm flex flex-col items-center">
+          <div className="w-full mb-4 empty:hidden [&>div]:!px-0 [&>div]:!pt-0">
+            <PendingRecordings />
+          </div>
           <h1 className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 tracking-tight">New recording</h1>
           <p className="text-neutral-500 dark:text-neutral-400 text-sm mb-8">What are you recording?</p>
 
@@ -543,8 +617,21 @@ export default function Recording() {
             />
           </div>
 
+          <label className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-3 rounded-2xl border border-dashed border-neutral-300 dark:border-neutral-700 text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:border-neutral-400 dark:hover:border-neutral-500 cursor-pointer transition-colors">
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+            </svg>
+            Import an audio file
+            <input
+              type="file"
+              accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.webm,.ogg,.aac"
+              className="sr-only"
+              onChange={(e) => importFile(e.target.files?.[0])}
+            />
+          </label>
+
           <ul className="mt-8 text-xs text-neutral-400 dark:text-neutral-500 space-y-1.5 text-left w-full">
-            <li className="flex gap-2"><Dot />Recordings are backed up on this device as you go, so nothing is lost if the page closes.</li>
+            <li className="flex gap-2"><Dot />Recordings are saved on this device and backed up to the cloud as you go, so nothing is lost if the page closes or the connection drops.</li>
             <li className="flex gap-2"><Dot />Up to 2 hours per recording. You can pause and resume.</li>
             <li className="flex gap-2"><Dot />Meeting mode works in Chrome and Edge on desktop.</li>
           </ul>
@@ -582,7 +669,7 @@ export default function Recording() {
             {phase === 'finalizing' ? 'Saving recording…' : pct >= 100 ? 'Finishing upload…' : 'Uploading recording…'}
           </p>
           <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-1">
-            {formatClock(elapsed)} recorded{upload.size ? ` · ${formatBytes(upload.size)}` : ''}
+            {importing ? 'Importing file' : `${formatClock(elapsed)} recorded`}{upload.size ? ` · ${formatBytes(upload.size)}` : ''}
           </p>
           {phase === 'uploading' && (
             <div className="mt-6 h-1.5 w-full rounded-full bg-neutral-200 dark:bg-neutral-800 overflow-hidden">
@@ -596,7 +683,7 @@ export default function Recording() {
           )}
           {notice && <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-4">{notice}</p>}
           <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-6">
-            Your recording is saved on this device until the upload completes.
+            {importing ? 'Keep this page open until the upload finishes.' : 'Your recording is saved on this device until the upload completes.'}
           </p>
         </div>
       </Screen>
@@ -613,12 +700,12 @@ export default function Recording() {
           <h1 className="text-xl font-semibold text-neutral-900 dark:text-white mb-2">Upload didn&apos;t finish</h1>
           <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-2 leading-relaxed">{error}</p>
           <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-8">
-            Your {formatClock(elapsed)} recording is safe on this device.
+            {importing ? 'Your original file was not changed.' : `Your ${formatClock(elapsed)} recording is safe on this device.`}
           </p>
           <div className="flex flex-col gap-2">
             <button type="button" onClick={doUpload} className="btn-primary">Retry upload</button>
-            <button type="button" onClick={saveForLater} className="btn-secondary">Upload later</button>
-            <button type="button" onClick={downloadAudio} className="btn-ghost">Download audio file</button>
+            {!importing && <button type="button" onClick={saveForLater} className="btn-secondary">Upload later</button>}
+            {!importing && <button type="button" onClick={downloadAudio} className="btn-ghost">Download audio file</button>}
             <button type="button" onClick={discard} className="btn-ghost text-red-500 dark:text-red-400">Discard recording</button>
           </div>
         </div>
@@ -695,9 +782,40 @@ export default function Recording() {
           </button>
           <div className="w-14" />
         </div>
-        <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-6">Tap the square to stop and save</p>
+        <CloudStatus cloud={cloud} backupOk={backupOk} starting={phase === 'starting'} />
       </div>
     </Screen>
+  )
+}
+
+function CloudStatus({ cloud, backupOk, starting }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000)
+    return () => clearInterval(t)
+  }, [])
+  if (starting) return <div className="h-5 mt-6" />
+
+  let tone = 'text-neutral-400 dark:text-neutral-500'
+  let label = 'Saving on this device…'
+  if (cloud?.lastAckAt) {
+    const ago = Math.round((now - cloud.lastAckAt) / 1000)
+    label = `Backed up to the cloud ${ago < 20 ? 'just now' : ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)} min ago`}`
+    tone = 'text-emerald-600 dark:text-emerald-400'
+  }
+  if (cloud?.lastError && cloud.behind > 1) {
+    label = backupOk
+      ? 'Cloud backup is waiting for a connection — saved on this device'
+      : 'Cloud backup is waiting for a connection — keep this tab open'
+    tone = 'text-amber-600 dark:text-amber-400'
+  }
+  return (
+    <p className={`flex items-center gap-1.5 text-xs mt-6 h-5 ${tone}`} role="status">
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15a4.5 4.5 0 004.5 4.5H18a3.75 3.75 0 001.332-7.257 3 3 0 00-3.758-3.848 5.25 5.25 0 00-10.233 2.33A4.502 4.502 0 002.25 15z" />
+      </svg>
+      {label}
+    </p>
   )
 }
 

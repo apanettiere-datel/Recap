@@ -3,6 +3,28 @@ import { db } from "../services/db.js";
 import { people, commitments, notes, notePeople, topics, quotes } from "../models/schema.js";
 import { eq, and, desc, asc, sql, inArray } from "drizzle-orm";
 import { AppEnv } from "../types.js";
+import { findQuoteTime } from "../services/segments.js";
+
+/** Conversation and open-commitment counts for many people in two queries. */
+async function peopleStats(ids: string[]) {
+  if (ids.length === 0) return new Map<string, { totalConversations: number; openCommitments: number }>();
+  const [noteCounts, openCounts] = await Promise.all([
+    db
+      .select({ personId: notePeople.personId, count: sql<number>`count(distinct ${notePeople.noteId})`.mapWith(Number) })
+      .from(notePeople)
+      .where(inArray(notePeople.personId, ids))
+      .groupBy(notePeople.personId),
+    db
+      .select({ personId: commitments.personId, count: sql<number>`count(*)`.mapWith(Number) })
+      .from(commitments)
+      .where(and(inArray(commitments.personId, ids), eq(commitments.status, "open")))
+      .groupBy(commitments.personId),
+  ]);
+  const stats = new Map(ids.map((id) => [id, { totalConversations: 0, openCommitments: 0 }]));
+  for (const r of noteCounts) stats.get(r.personId)!.totalConversations = r.count;
+  for (const r of openCounts) if (r.personId) stats.get(r.personId)!.openCommitments = r.count;
+  return stats;
+}
 
 const app = new Hono<AppEnv>();
 
@@ -16,25 +38,8 @@ app.get("/export", async (c) => {
     .where(eq(people.userId, userId))
     .orderBy(asc(people.name));
 
-  const withStats = await Promise.all(
-    userPeople.map(async (person) => {
-      const noteCount = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(notePeople)
-        .where(eq(notePeople.personId, person.id));
-
-      const openCommitments = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(commitments)
-        .where(and(eq(commitments.personId, person.id), eq(commitments.status, "open")));
-
-      return {
-        ...person,
-        totalConversations: Number(noteCount[0]?.count ?? 0),
-        openCommitments: Number(openCommitments[0]?.count ?? 0),
-      };
-    })
-  );
+  const stats = await peopleStats(userPeople.map((p) => p.id));
+  const withStats = userPeople.map((person) => ({ ...person, ...stats.get(person.id)! }));
 
   const escapeCSV = (val: string | null | undefined) => {
     if (val == null) return "";
@@ -86,25 +91,8 @@ app.get("/", async (c) => {
     .where(eq(people.userId, userId))
     .orderBy(orderClause);
 
-  const withStats = await Promise.all(
-    userPeople.map(async (person) => {
-      const noteCount = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(notePeople)
-        .where(eq(notePeople.personId, person.id));
-
-      const openCommitments = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(commitments)
-        .where(and(eq(commitments.personId, person.id), eq(commitments.status, "open")));
-
-      return {
-        ...person,
-        totalConversations: Number(noteCount[0]?.count ?? 0),
-        openCommitments: Number(openCommitments[0]?.count ?? 0),
-      };
-    })
-  );
+  const stats = await peopleStats(userPeople.map((p) => p.id));
+  const withStats = userPeople.map((person) => ({ ...person, ...stats.get(person.id)! }));
 
   return c.json(withStats);
 });
@@ -121,17 +109,48 @@ app.get("/:id", async (c) => {
 
   if (!person) return c.json({ error: "Not found" }, 404);
 
-  const personNotes = await db
-    .select({ note: notes })
+  const noteRows = await db
+    .selectDistinct({
+      note: {
+        id: notes.id,
+        title: notes.title,
+        summary: notes.summary,
+        sentiment: notes.sentiment,
+        duration: notes.duration,
+        recordedAt: notes.recordedAt,
+        isProcessing: notes.isProcessing,
+        processingError: notes.processingError,
+        isArchived: notes.isArchived,
+        hasAudio: sql<boolean>`${notes.audioUrl} <> ''`,
+      },
+    })
     .from(notePeople)
     .innerJoin(notes, eq(notePeople.noteId, notes.id))
     .where(eq(notePeople.personId, personId))
     .orderBy(desc(notes.recordedAt));
+  const personNotes = noteRows;
 
   const personCommitments = await db
     .select()
     .from(commitments)
     .where(eq(commitments.personId, personId));
+
+  // What this person said, linked to the moment in the recording
+  const quoteRows = await db
+    .select({
+      id: quotes.id,
+      text: quotes.text,
+      noteId: quotes.noteId,
+      noteTitle: notes.title,
+      recordedAt: notes.recordedAt,
+      segments: notes.segments,
+    })
+    .from(quotes)
+    .innerJoin(notes, eq(quotes.noteId, notes.id))
+    .where(and(eq(quotes.personId, personId), eq(notes.userId, userId)))
+    .orderBy(desc(notes.recordedAt))
+    .limit(20);
+  const personQuotes = quoteRows.map(({ segments, ...q }) => ({ ...q, start: findQuoteTime(q.text, segments) }));
 
   // Compute insights
   const noteIds = personNotes.map((r) => r.note.id);
@@ -166,6 +185,7 @@ app.get("/:id", async (c) => {
     ...person,
     personalNotes: person.notes || null,
     notes: personNotes.map((r) => r.note),
+    quotes: personQuotes,
     commitments: personCommitments,
     insights: {
       frequentTopics,

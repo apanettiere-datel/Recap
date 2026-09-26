@@ -47,6 +47,7 @@ export default function People() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [sort, setSort] = useState('lastContact')
+  const [filter, setFilter] = useState('')
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ name: '', role: '', organization: '', phone: '', email: '', relationship: '' })
 
@@ -108,6 +109,12 @@ export default function People() {
     )
   }
 
+
+  const needle = filter.trim().toLowerCase()
+  const visiblePeople = (people || [])
+    .filter((p) => p.relationship !== 'organization')
+    .filter((p) => !needle || [p.name, p.organization, p.role, p.email, p.phone, p.relationship, ...(p.keywords || [])]
+      .some((v) => v && String(v).toLowerCase().includes(needle)))
   return (
     <div className="min-h-screen bg-neutral-50 dark:bg-black pb-6">
       {/* Header */}
@@ -217,6 +224,31 @@ export default function People() {
           </form>
         )}
 
+        {people?.some((p) => p.relationship !== 'organization') && (
+          <div className="relative mb-4">
+            <svg className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+            <input
+              type="search"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search people by name, company, role, email…"
+              aria-label="Search people"
+              className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-white placeholder-neutral-400 outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10 transition"
+            />
+          </div>
+        )}
+
+        {filter && visiblePeople.length === 0 && (
+          <div className="text-center py-10">
+            <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-2">No one matches &ldquo;{filter}&rdquo;.</p>
+            <button type="button" onClick={() => navigate(`/search?q=${encodeURIComponent(filter)}`)} className="text-sm font-medium text-blue-600 dark:text-blue-400">
+              Search your conversations for &ldquo;{filter}&rdquo; instead →
+            </button>
+          </div>
+        )}
+
         {!people || people.filter(p => p.relationship !== 'organization').length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-center">
             <div className="w-16 h-16 rounded-full bg-neutral-200 dark:bg-neutral-800 flex items-center justify-center mb-4">
@@ -231,7 +263,7 @@ export default function People() {
           </div>
         ) : (
           <div className="bg-white dark:bg-neutral-900 rounded-2xl border border-neutral-200 dark:border-neutral-800 divide-y divide-neutral-100 dark:divide-neutral-800">
-            {people.filter(p => p.relationship !== 'organization').map((person) => (
+            {visiblePeople.map((person) => (
               <button
                 key={person.id}
                 type="button"

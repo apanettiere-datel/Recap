@@ -6,6 +6,7 @@ import { useTheme } from '../../lib/useTheme';
 import { Type } from '../../lib/typography';
 import { useNotes, useDeleteNote } from '../../hooks/useNotes';
 import { NoteCard } from '../../components/feed/NoteCard';
+import { PendingUploads } from '../../components/feed/PendingUploads';
 import { FAB } from '../../components/ui/FAB';
 import { QuickMemo } from '../../components/recording/QuickMemo';
 import { Bell, BubbleLeftFill, Search as SearchIcon } from '../../components/icons';
@@ -81,6 +82,7 @@ export default function FeedScreen() {
           keyExtractor={(item) => item.id}
           renderItem={renderNote}
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 130 }}
+          ListHeaderComponent={<PendingUploads t={t} />}
           refreshControl={
             <RefreshControl
               refreshing={isRefetching}

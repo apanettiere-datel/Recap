@@ -5,6 +5,7 @@ import { useState } from 'react'
 import CommitmentRow from '@/components/CommitmentRow'
 import AddToCalendarSheet from '@/components/AddToCalendarSheet'
 import ShareSheet from '@/components/ShareSheet'
+import PersonConversations from '@/components/PersonConversations'
 
 const AVATAR_COLORS = [
   'bg-blue-500', 'bg-purple-500', 'bg-pink-500', 'bg-teal-500',
@@ -424,6 +425,8 @@ export default function PersonDetail() {
             <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">Avg Interval</p>
           </div>
         </div>
+
+        <PersonConversations person={person} />
 
         {/* Frequent Topics */}
         {person.insights?.frequentTopics?.length > 0 && (

@@ -1,15 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, Pressable, Alert, Platform } from 'react-native';
+import { View, Text, Pressable, Alert, Platform, AppState } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { Audio } from 'expo-av';
 import * as Haptics from 'expo-haptics';
+import { useQueryClient } from '@tanstack/react-query';
 import { useTheme } from '../lib/useTheme';
 import { Type } from '../lib/typography';
 import { useRecordingStore } from '../stores/recording';
 import { usePreferences } from '../stores/preferences';
-import { useUploadNote } from '../hooks/useNotes';
-import { MicFill, StopFill, Xmark } from '../components/icons';
+import { MicFill, StopFill } from '../components/icons';
+import { prepareRecordingAudio, RECORDING_OPTIONS, stopAndSave, uploadNow, resetAudioMode } from '../lib/recorder';
+import { processQueue } from '../lib/recordingQueue';
 
 const MAX_RECORDING_SECONDS = 2 * 60 * 60; // 2 hours
 
@@ -46,129 +48,234 @@ function WaveformBars({ levels }: { levels: number[] }) {
   );
 }
 
+type Phase = 'starting' | 'recording' | 'paused' | 'saving' | 'uploading' | 'error';
+
 export default function RecordingScreen() {
   const { t } = useTheme();
-  const { state, seconds, mode, setState, setSeconds, setMode, setUri, reset } = useRecordingStore();
+  const params = useLocalSearchParams<{ personId?: string }>();
+  const queryClient = useQueryClient();
+  const { mode, setMode, setState, reset } = useRecordingStore();
   const defaultMode = usePreferences(s => s.defaultRecordingMode);
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+
+  const [phase, setPhase] = useState<Phase>('starting');
+  const [seconds, setSeconds] = useState(0);
+  const [notice, setNotice] = useState<string | null>(null);
   const [meterLevels, setMeterLevels] = useState<number[]>(Array(NUM_BARS).fill(0));
-  const uploadNote = useUploadNote();
-  const timer = useRef<ReturnType<typeof setInterval>>(undefined);
-  const meterTimer = useRef<ReturnType<typeof setInterval>>(undefined);
+
+  const recRef = useRef<Audio.Recording | null>(null);
+  const phaseRef = useRef<Phase>('starting');
+  const finishingRef = useRef(false);
+  const userPausedRef = useRef(false);
+  const durationMsRef = useRef(0);
+  const startedAtRef = useRef(new Date().toISOString());
+  const modeRef = useRef(mode);
   const levelsRef = useRef<number[]>(Array(NUM_BARS).fill(0));
 
-  const startMetering = useCallback((rec: Audio.Recording) => {
-    meterTimer.current = setInterval(async () => {
-      try {
-        const status = await rec.getStatusAsync();
-        if (status.isRecording && status.metering !== undefined) {
-          const db = status.metering;
-          const normalized = Math.min(1, Math.max(0, (db + 60) / 60));
-          const newLevels = [...levelsRef.current.slice(1), normalized];
-          levelsRef.current = newLevels;
-          setMeterLevels(newLevels);
-        }
-      } catch {}
-    }, 100);
-  }, []);
+  const go = (p: Phase) => {
+    phaseRef.current = p;
+    setPhase(p);
+    setState(p === 'recording' ? 'recording' : p === 'paused' ? 'paused' : p === 'starting' ? 'idle' : 'processing');
+  };
 
-  const startRecording = useCallback(async () => {
+  /** Stop, save to the phone, then try to upload. Audio is never discarded here. */
+  const finish = useCallback(async (reason?: string) => {
+    const rec = recRef.current;
+    if (!rec || finishingRef.current) return;
+    finishingRef.current = true;
+    recRef.current = null;
+    if (reason) setNotice(reason);
+    go('saving');
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
+
+    const item = await stopAndSave(rec, {
+      mode: modeRef.current,
+      durationMs: durationMsRef.current,
+      personId: params.personId ?? null,
+      startedAt: startedAtRef.current,
+    }).catch(() => null);
+
+    if (!item) {
+      go('error');
+      Alert.alert('Nothing was recorded', 'No audio was captured. Check that Recap has microphone access and try again.', [
+        { text: 'OK', onPress: () => { reset(); router.back(); } },
+      ]);
+      return;
+    }
+
+    go('uploading');
+    const result = await uploadNow(item);
+    queryClient.invalidateQueries({ queryKey: ['notes'] });
+    reset();
+    if (result.noteId) {
+      router.replace(`/note/${result.noteId}`);
+    } else {
+      Alert.alert(
+        'Saved on your phone',
+        "Your recording is safe on this device but couldn't be uploaded yet. Recap will keep retrying automatically — you can also retry from the home screen.",
+        [{ text: 'OK', onPress: () => router.back() }],
+      );
+    }
+  }, [params.personId, queryClient, reset]);
+
+  const onStatus = useCallback((status: Audio.RecordingStatus) => {
+    if (status.durationMillis) durationMsRef.current = status.durationMillis;
+    setSeconds(Math.floor((status.durationMillis || 0) / 1000));
+
+    if (status.isRecording && status.metering !== undefined) {
+      const normalized = Math.min(1, Math.max(0, (status.metering + 60) / 60));
+      const next = [...levelsRef.current.slice(1), normalized];
+      levelsRef.current = next;
+      setMeterLevels(next);
+    }
+
+    // The OS stopped the recorder (e.g. input device lost): save what we have
+    if ((status.isDoneRecording || (status as { mediaServicesDidReset?: boolean }).mediaServicesDidReset) && !finishingRef.current) {
+      finish('Recording was interrupted by your phone, so it was stopped and saved.');
+      return;
+    }
+    if ((status.durationMillis || 0) >= MAX_RECORDING_SECONDS * 1000 && !finishingRef.current) {
+      finish('You reached the 2-hour limit, so the recording was stopped and saved.');
+    }
+  }, [finish]);
+
+  const start = useCallback(async () => {
+    go('starting');
     try {
       const { granted } = await Audio.requestPermissionsAsync();
       if (!granted) {
-        Alert.alert('Permission Required', 'Microphone access is needed to record conversations.');
+        go('error');
+        Alert.alert('Microphone access needed', 'Allow microphone access for Recap in Settings to record conversations.', [
+          { text: 'OK', onPress: () => router.back() },
+        ]);
         return;
       }
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const { recording: rec } = await Audio.Recording.createAsync({
-        ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
-        isMeteringEnabled: true,
-      });
-      setRecording(rec);
-      setState('recording');
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-
-      startMetering(rec);
-      timer.current = setInterval(() => setSeconds(useRecordingStore.getState().seconds + 1), 1000);
+      await prepareRecordingAudio();
+      const { recording } = await Audio.Recording.createAsync(RECORDING_OPTIONS, onStatus, 250);
+      recRef.current = recording;
+      startedAtRef.current = new Date().toISOString();
+      finishingRef.current = false;
+      go('recording');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     } catch (err) {
       console.error('Failed to start recording:', err);
-      Alert.alert('Error', 'Could not start recording.');
+      await resetAudioMode();
+      go('error');
+      Alert.alert("Couldn't start recording", 'Another app may be using the microphone. Close it and try again.', [
+        { text: 'OK', onPress: () => router.back() },
+      ]);
     }
-  }, []);
+  }, [onStatus]);
 
-  const stopRecording = useCallback(async () => {
-    if (!recording) return;
-    setState('processing');
-    clearInterval(timer.current);
-    clearInterval(meterTimer.current);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-
+  const pause = async () => {
+    const rec = recRef.current;
+    if (!rec) return;
     try {
-      await recording.stopAndUnloadAsync();
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-      const uri = recording.getURI();
-      setUri(uri);
-      setRecording(null);
+      await rec.pauseAsync();
+      userPausedRef.current = true;
+      go('paused');
+    } catch {
+      // ignore
+    }
+  };
 
+  const resume = async () => {
+    const rec = recRef.current;
+    if (!rec) return;
+    try {
+      await rec.startAsync();
+      userPausedRef.current = false;
+      setNotice(null);
+      go('recording');
+    } catch {
+      finish('The recording could not be resumed, so it was saved.');
+    }
+  };
+
+  const cancel = () => {
+    if (!recRef.current || seconds < 3) {
+      discard();
+      return;
+    }
+    Alert.alert('Discard recording?', 'This recording will be deleted and cannot be recovered.', [
+      { text: 'Keep recording', style: 'cancel' },
+      { text: 'Save it', onPress: () => finish() },
+      { text: 'Discard', style: 'destructive', onPress: discard },
+    ]);
+  };
+
+  const discard = async () => {
+    const rec = recRef.current;
+    recRef.current = null;
+    finishingRef.current = true;
+    if (rec) {
+      await rec.stopAndUnloadAsync().catch(() => {});
+      const uri = rec.getURI();
       if (uri) {
-        const formData = new FormData();
-        formData.append('audio', {
-          uri,
-          name: 'recording.m4a',
-          type: 'audio/m4a',
-        } as any);
-        formData.append('mode', mode);
-        formData.append('duration', String(seconds));
-        await uploadNote.mutateAsync(formData);
+        const FileSystem = await import('expo-file-system/legacy');
+        FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
       }
-
-      reset();
-      router.back();
-    } catch (err) {
-      console.error('Failed to stop recording:', err);
-      setState('idle');
     }
-  }, [recording, mode]);
-
-  useEffect(() => {
-    setMode(defaultMode);
-    startRecording();
-    return () => {
-      clearInterval(timer.current);
-      clearInterval(meterTimer.current);
-      if (recording) {
-        recording.stopAndUnloadAsync().catch(() => {});
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (seconds >= MAX_RECORDING_SECONDS && state === 'recording') {
-      Alert.alert('Recording Limit', 'Maximum recording length (2 hours) reached. Your recording is being saved and processed.');
-      stopRecording();
-    }
-  }, [seconds, state, stopRecording]);
-
-  const handleCancel = async () => {
-    clearInterval(timer.current);
-    if (recording) {
-      await recording.stopAndUnloadAsync().catch(() => {});
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-    }
+    await resetAudioMode();
     reset();
     router.back();
   };
 
+  useEffect(() => {
+    setMode(defaultMode);
+    modeRef.current = defaultMode;
+    start();
+
+    // Returning to the app: if a phone call or another app paused the recorder, resume it
+    const sub = AppState.addEventListener('change', async (state) => {
+      const rec = recRef.current;
+      if (state !== 'active' || !rec || finishingRef.current || userPausedRef.current) return;
+      try {
+        const status = await rec.getStatusAsync();
+        if (!status.isRecording && !status.isDoneRecording && status.canRecord) {
+          await rec.startAsync();
+          setNotice('Recording was paused by your phone and has resumed.');
+          go('recording');
+        }
+      } catch {
+        finish('Recording was interrupted, so it was stopped and saved.');
+      }
+    });
+
+    return () => {
+      sub.remove();
+      // Screen dismissed mid-recording (e.g. swiped away): save instead of losing it
+      const rec = recRef.current;
+      if (rec && !finishingRef.current) {
+        finishingRef.current = true;
+        recRef.current = null;
+        stopAndSave(rec, {
+          mode: modeRef.current,
+          durationMs: durationMsRef.current,
+          personId: params.personId ?? null,
+          startedAt: startedAtRef.current,
+        })
+          .then(() => processQueue())
+          .then(() => queryClient.invalidateQueries({ queryKey: ['notes'] }))
+          .catch(() => {});
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const recording = phase === 'recording';
+  const busy = phase === 'saving' || phase === 'uploading';
+  const statusText =
+    phase === 'starting' ? 'Starting…'
+    : phase === 'recording' ? 'Recording · keeps going if your screen locks'
+    : phase === 'paused' ? 'Paused'
+    : phase === 'saving' ? 'Saving to your phone…'
+    : phase === 'uploading' ? 'Saved on your phone · uploading…'
+    : '';
+
   return (
     <View style={{ flex: 1, backgroundColor: '#000' }}>
       <SafeAreaView style={{ flex: 1 }}>
-        {/* Consent banner */}
-        {state === 'recording' && (
+        {(recording || phase === 'paused') && (
           <View style={{
             marginHorizontal: 16, marginTop: 8, padding: 12,
             backgroundColor: 'rgba(255,149,0,0.15)', borderRadius: 12,
@@ -181,9 +288,8 @@ export default function RecordingScreen() {
           </View>
         )}
 
-        {/* Center content */}
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 }}>
-          <WaveformBars levels={meterLevels} />
+          <WaveformBars levels={phase === 'paused' ? Array(NUM_BARS).fill(0) : meterLevels} />
           <Text style={{
             fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
             fontSize: 56, fontWeight: '200', color: '#fff',
@@ -196,37 +302,42 @@ export default function RecordingScreen() {
             {mode.replace('_', ' ')}
           </Text>
           <Text style={{ ...Type.caption, color: 'rgba(255,255,255,0.5)', marginTop: 8, textAlign: 'center' }}>
-            {state === 'recording' ? 'Recording · tap to stop' : state === 'processing' ? 'Processing...' : 'Tap to record'}
+            {statusText}
           </Text>
+          {notice && (
+            <Text style={{ ...Type.caption, color: '#ff9f0a', marginTop: 12, textAlign: 'center' }}>{notice}</Text>
+          )}
         </View>
 
-        {/* Bottom controls */}
         <View style={{
           flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
           paddingHorizontal: 28, paddingBottom: 40,
         }}>
-          <Pressable onPress={handleCancel} style={{ padding: 8 }}>
+          <Pressable onPress={cancel} disabled={busy} style={{ padding: 8, width: 72, opacity: busy ? 0.3 : 1 }}>
             <Text style={{ ...Type.body, color: 'rgba(255,255,255,0.7)' }}>Cancel</Text>
           </Pressable>
 
           <Pressable
-            onPress={state === 'recording' ? stopRecording : startRecording}
-            disabled={state === 'processing'}
+            onPress={() => finish()}
+            disabled={busy || phase === 'starting' || phase === 'error'}
+            accessibilityLabel="Stop and save"
             style={({ pressed }) => ({
               width: 80, height: 80, borderRadius: 40,
-              backgroundColor: state === 'recording' ? 'rgba(255,255,255,0.15)' : t.red,
+              backgroundColor: recording || phase === 'paused' ? 'rgba(255,255,255,0.15)' : t.red,
               alignItems: 'center', justifyContent: 'center',
               borderWidth: 4, borderColor: 'rgba(255,255,255,0.3)',
-              opacity: pressed ? 0.7 : 1,
+              opacity: pressed || busy ? 0.6 : 1,
             })}>
-            {state === 'recording' ? (
-              <StopFill size={32} color="#fff" />
-            ) : (
-              <MicFill size={32} color="#fff" />
-            )}
+            {recording || phase === 'paused' ? <StopFill size={32} color="#fff" /> : <MicFill size={32} color="#fff" />}
           </Pressable>
 
-          <View style={{ width: 60 }} />
+          <Pressable
+            onPress={phase === 'paused' ? resume : pause}
+            disabled={!(recording || phase === 'paused')}
+            style={{ padding: 8, width: 72, alignItems: 'flex-end', opacity: recording || phase === 'paused' ? 1 : 0.3 }}
+          >
+            <Text style={{ ...Type.body, color: 'rgba(255,255,255,0.7)' }}>{phase === 'paused' ? 'Resume' : 'Pause'}</Text>
+          </Pressable>
         </View>
       </SafeAreaView>
     </View>

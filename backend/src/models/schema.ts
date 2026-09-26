@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, boolean, real, integer, pgEnum } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, boolean, real, integer, pgEnum, jsonb } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
 export const commitmentOwnerEnum = pgEnum("commitment_owner", ["me", "them"]);
@@ -20,14 +20,24 @@ export const users = pgTable("users", {
   firebaseUid: text("firebase_uid").notNull().unique(),
   email: text("email"),
   displayName: text("display_name"),
+  digestEnabled: boolean("digest_enabled").default(false).notNull(),
+  digestEmail: text("digest_email"),
+  digestDay: integer("digest_day").default(1).notNull(), // 0 = Sunday
+  digestHour: integer("digest_hour").default(8).notNull(),
+  timezone: text("timezone").default("UTC").notNull(),
+  lastDigestSentAt: timestamp("last_digest_sent_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
+/** A timed piece of transcript: start/end seconds and text. */
+export type TranscriptSegment = { s: number; e: number; t: string };
 
 export const notes = pgTable("notes", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   title: text("title").default("").notNull(),
   transcript: text("transcript").default("").notNull(),
+  segments: jsonb("segments").$type<TranscriptSegment[]>(),
   summary: text("summary").default("").notNull(),
   sentiment: text("sentiment").default("").notNull(),
   audioUrl: text("audio_url").notNull(),

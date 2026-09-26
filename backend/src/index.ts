@@ -11,6 +11,7 @@ import commitmentsRoutes from "./routes/commitments.js";
 import insightsRoutes from "./routes/insights.js";
 import usersRoutes from "./routes/users.js";
 import briefingRoutes from "./routes/briefing.js";
+import recordingsRoutes, { recoverAbandonedSessions } from "./routes/recordings.js";
 import { startWeeklyJobs } from "./jobs/weekly.js";
 import { db } from "./services/db.js";
 import { sql } from "drizzle-orm";
@@ -31,7 +32,7 @@ app.onError((err, c) => {
 app.notFound((c) => c.json({ error: "Not found" }, 404));
 app.use("*", cors({
   origin: "*",
-  allowMethods: ["GET", "POST", "PATCH", "DELETE"],
+  allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   allowHeaders: ["Authorization", "Content-Type"],
 }));
 
@@ -50,6 +51,7 @@ app.use("/api/*", authMiddleware);
 app.use("/api/*", rateLimiter);
 
 // User sync (before resolveUser since it creates the user)
+app.use("/api/users/me/*", resolveUser);
 app.route("/api/users", usersRoutes);
 
 // All other routes need a resolved user
@@ -62,6 +64,11 @@ app.use("/api/commitments/*", resolveUser);
 app.use("/api/insights", resolveUser);
 app.use("/api/insights/*", resolveUser);
 app.use("/api/briefing/*", resolveUser);
+app.use("/api/recordings/*", resolveUser);
+app.use("/api/recordings/*", bodyLimit({
+  maxSize: 40 * 1024 * 1024,
+  onError: (c) => c.json({ error: "Recording part too large" }, 413),
+}));
 
 // Audio upload limit: 250MB (supports recordings up to ~2 hours)
 app.use("/api/notes", validateContentLength(250 * 1024 * 1024));
@@ -76,6 +83,7 @@ app.route("/api/people", peopleRoutes);
 app.route("/api/commitments", commitmentsRoutes);
 app.route("/api/insights", insightsRoutes);
 app.route("/api/briefing", briefingRoutes);
+app.route("/api/recordings", recordingsRoutes);
 
 const port = parseInt(process.env.PORT ?? "3000");
 
@@ -87,6 +95,13 @@ async function ensureSchema() {
   await db.execute(sql.raw(`
     ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "processing_stage" text;
     ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "processing_started_at" timestamp;
+    ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "segments" jsonb;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "digest_enabled" boolean DEFAULT false NOT NULL;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "digest_email" text;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "digest_day" integer DEFAULT 1 NOT NULL;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "digest_hour" integer DEFAULT 8 NOT NULL;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "timezone" text DEFAULT 'UTC' NOT NULL;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "last_digest_sent_at" timestamp;
   `));
 }
 
@@ -104,6 +119,10 @@ async function startBackgroundWork() {
   setInterval(() => {
     failOrphanedProcessing().catch((e) => console.error("[watchdog] failed:", e));
   }, 10 * 60 * 1000).unref();
+  // Recordings whose device disappeared mid-recording
+  const recover = () => recoverAbandonedSessions().catch((e) => console.error("[recordings] recovery failed:", e));
+  recover();
+  setInterval(recover, 5 * 60 * 1000).unref();
 }
 
 serve({ fetch: app.fetch, port }, () => {

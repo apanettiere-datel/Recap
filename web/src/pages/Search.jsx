@@ -124,9 +124,12 @@ export default function Search() {
     saveRecent(next)
   }
 
-  const openNote = (id) => {
+  const openNote = (id, time) => {
     remember()
-    navigate(`/note/${id}${q ? `?q=${encodeURIComponent(q)}` : ''}`)
+    const sp = new URLSearchParams()
+    if (q) sp.set('q', q)
+    if (time != null) sp.set('t', String(Math.floor(time)))
+    navigate(`/note/${id}${sp.toString() ? `?${sp}` : ''}`)
   }
   const hasFilters = personId || range || includeArchived
   const showInitial = !q
@@ -321,7 +324,7 @@ export default function Search() {
             </div>
             <div className={`flex flex-col gap-3 transition-opacity ${search.isPlaceholderData ? 'opacity-60' : ''}`}>
               {notes.map((note) => (
-                <NoteCard key={note.id} note={note} terms={terms} onClick={() => openNote(note.id)} />
+                <NoteCard key={note.id} note={note} terms={terms} onClick={() => openNote(note.id)} onOpenAt={(t) => openNote(note.id, t)} />
               ))}
             </div>
             {search.hasNextPage && (

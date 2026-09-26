@@ -5,7 +5,61 @@ import { eq, and, desc } from "drizzle-orm";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export async function chatWithNotes(userId: string, userMessage: string): Promise<string> {
+export type ChatTurn = { role: "user" | "assistant"; content: string };
+
+function sanitizeHistory(history: unknown): ChatTurn[] {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter((m): m is ChatTurn => !!m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .slice(-10)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+}
+
+function clock(seconds: number) {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+/** Answer questions about one conversation, citing [m:ss] moments in the recording. */
+export async function chatWithNote(userId: string, noteId: string, userMessage: string, history?: unknown): Promise<string | null> {
+  const [note] = await db.select().from(notes).where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  if (!note) return null;
+
+  const noteCommitments = await db.select().from(commitments).where(eq(commitments.noteId, noteId));
+  const timed = note.segments?.length
+    ? note.segments.map((s) => `[${clock(s.s)}] ${s.t}`).join("\n")
+    : note.transcript;
+  const transcript = timed.length > 60000 ? `${timed.slice(0, 60000)}\n[transcript truncated]` : timed;
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content: `You answer questions about ONE recorded conversation, using only the transcript and analysis below.
+- If the answer isn't in the conversation, say so plainly.
+- When you refer to something that was said, cite the moment with its timestamp exactly as it appears, like [12:34], so the app can link to the audio.
+- Be concise.
+
+Conversation: ${note.title || "Untitled"} (${note.recordedAt.toISOString().split("T")[0]})
+Summary: ${note.summary}
+Commitments: ${noteCommitments.map((c) => `[${c.owner}] ${c.description} (${c.status})`).join("; ") || "none"}
+
+Transcript:
+${transcript || "(no transcript)"}`,
+      },
+      ...sanitizeHistory(history),
+      { role: "user", content: userMessage },
+    ],
+  });
+  return response.choices[0].message.content ?? "I couldn't find that in this conversation.";
+}
+
+export async function chatWithNotes(userId: string, userMessage: string, history?: unknown): Promise<string> {
   const userNotes = await db
     .select()
     .from(notes)
@@ -65,6 +119,7 @@ ${userNotes.length === 0 ? "The user has NO recorded conversations yet." : `User
 
 ${userPeople.length === 0 ? "The user has NO people in their contacts yet." : `People the user talks to:\n${peopleContext}`}`,
       },
+      ...sanitizeHistory(history),
       { role: "user", content: userMessage },
     ],
   });

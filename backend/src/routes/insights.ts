@@ -3,7 +3,7 @@ import { db } from "../services/db.js";
 import { insights, weeklyReports } from "../models/schema.js";
 import { eq, and, desc } from "drizzle-orm";
 import { generateInsights, generateWeeklyReport } from "../services/insights.js";
-import { chatWithNotes } from "../services/chat.js";
+import { chatWithNotes, chatWithNote } from "../services/chat.js";
 import { AppEnv } from "../types.js";
 
 const app = new Hono<AppEnv>();
@@ -65,12 +65,24 @@ app.post("/reports/generate", async (c) => {
 // Chat with notes
 app.post("/chat", async (c) => {
   const userId = c.get("userId") as string;
-  const { message } = await c.req.json<{ message: string }>();
+  const body = await c.req.json<{ message: string; noteId?: string; history?: unknown }>().catch(() => null);
+  const message = body?.message?.trim().slice(0, 4000);
 
-  if (!message?.trim()) return c.json({ error: "Message required" }, 400);
+  if (!message) return c.json({ error: "Message required" }, 400);
 
-  const reply = await chatWithNotes(userId, message);
-  return c.json({ reply });
+  try {
+    if (body?.noteId) {
+      if (!/^[0-9a-f-]{36}$/i.test(body.noteId)) return c.json({ error: "Conversation not found" }, 404);
+      const reply = await chatWithNote(userId, body.noteId, message, body.history);
+      if (reply === null) return c.json({ error: "Conversation not found" }, 404);
+      return c.json({ reply });
+    }
+    const reply = await chatWithNotes(userId, message, body?.history);
+    return c.json({ reply });
+  } catch (err) {
+    console.error("[chat] failed:", err);
+    return c.json({ error: "The assistant is unavailable right now. Please try again." }, 502);
+  }
 });
 
 export default app;

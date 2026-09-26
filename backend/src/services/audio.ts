@@ -44,6 +44,8 @@ export function sniffAudioFormat(header: Uint8Array): { ext: string; mime: strin
 
 export interface PreparedAudio {
   chunkPaths: string[];
+  /** Per-chunk durations (null where unknown), used to offset timestamps. */
+  chunkDurations: (number | null)[];
   durationSecs: number | null;
 }
 
@@ -91,13 +93,15 @@ export async function normalizeAndSplit(inputPath: string, workDir: string): Pro
 
   let total = 0;
   let known = true;
+  const chunkDurations: (number | null)[] = [];
   for (const chunk of chunkPaths) {
     const d = await probeDuration(chunk);
+    chunkDurations.push(d);
     if (d === null) known = false;
     else total += d;
   }
 
-  return { chunkPaths, durationSecs: known ? total : null };
+  return { chunkPaths, chunkDurations, durationSecs: known ? total : null };
 }
 
 async function listChunks(dir: string): Promise<string[]> {

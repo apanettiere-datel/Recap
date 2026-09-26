@@ -4,8 +4,9 @@ import { Audio } from 'expo-av';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '../../lib/useTheme';
 import { Type } from '../../lib/typography';
-import { useUploadNote } from '../../hooks/useNotes';
+import { useQueryClient } from '@tanstack/react-query';
 import { StopFill } from '../icons';
+import { prepareRecordingAudio, RECORDING_OPTIONS, stopAndSave, uploadNow, resetAudioMode } from '../../lib/recorder';
 
 interface QuickMemoProps {
   visible: boolean;
@@ -17,7 +18,9 @@ const fmt = (n: number) =>
 
 export function QuickMemo({ visible, onClose }: QuickMemoProps) {
   const { t } = useTheme();
-  const uploadNote = useUploadNote();
+  const queryClient = useQueryClient();
+  const recRef = useRef<Audio.Recording | null>(null);
+  const startedAtRef = useRef(new Date().toISOString());
 
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [seconds, setSeconds] = useState(0);
@@ -84,14 +87,11 @@ export function QuickMemo({ visible, onClose }: QuickMemoProps) {
         return;
       }
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
+      await prepareRecordingAudio();
 
-      const { recording: rec } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
+      const { recording: rec } = await Audio.Recording.createAsync(RECORDING_OPTIONS);
+      recRef.current = rec;
+      startedAtRef.current = new Date().toISOString();
       setRecording(rec);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
@@ -108,38 +108,32 @@ export function QuickMemo({ visible, onClose }: QuickMemoProps) {
     }
   }, [onClose]);
 
+  /** Save the memo to the phone first, then upload; audio is never thrown away here. */
   const stopAndUpload = useCallback(async () => {
-    if (!recording) return;
+    const rec = recRef.current;
+    if (!rec) return;
+    recRef.current = null;
     setIsUploading(true);
     clearInterval(timer.current);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
 
-    try {
-      await recording.stopAndUnloadAsync();
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-      const uri = recording.getURI();
-      setRecording(null);
+    const item = await stopAndSave(rec, {
+      mode: 'voice_memo',
+      durationMs: secondsRef.current * 1000,
+      startedAt: startedAtRef.current,
+    }).catch(() => null);
+    setRecording(null);
 
-      if (uri) {
-        const formData = new FormData();
-        formData.append('audio', {
-          uri,
-          name: 'voice_memo.m4a',
-          type: 'audio/m4a',
-        } as any);
-        formData.append('mode', 'voice_memo');
-        await uploadNote.mutateAsync(formData);
+    if (item) {
+      const result = await uploadNow(item);
+      queryClient.invalidateQueries({ queryKey: ['notes'] });
+      if (result.error) {
+        Alert.alert('Saved on your phone', "Your memo couldn't be uploaded yet. Recap will keep retrying automatically.");
       }
-
-      cleanup();
-      onClose();
-    } catch (err) {
-      console.error('QuickMemo: failed to stop/upload:', err);
-      Alert.alert('Error', 'Could not save voice memo.');
-      cleanup();
-      onClose();
     }
-  }, [recording, onClose, uploadNote]);
+    cleanup();
+    onClose();
+  }, [onClose, queryClient]);
 
   const cleanup = useCallback(() => {
     clearInterval(timer.current);
@@ -154,10 +148,13 @@ export function QuickMemo({ visible, onClose }: QuickMemoProps) {
     if (visible) {
       startRecording();
     } else {
-      // If dismissed externally, clean up
-      if (recording) {
-        recording.stopAndUnloadAsync().catch(() => {});
-        Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
+      // Dismissed externally: keep what was recorded
+      if (recRef.current) {
+        const rec = recRef.current;
+        recRef.current = null;
+        stopAndSave(rec, { mode: 'voice_memo', durationMs: secondsRef.current * 1000, startedAt: startedAtRef.current })
+          .then((item) => item && uploadNow(item))
+          .finally(() => queryClient.invalidateQueries({ queryKey: ['notes'] }));
       }
       cleanup();
     }
@@ -193,10 +190,15 @@ export function QuickMemo({ visible, onClose }: QuickMemoProps) {
           backgroundColor: 'rgba(0,0,0,0.4)',
         }}
         onPress={() => {
-          // Cancel recording on backdrop tap
-          if (recording) {
-            recording.stopAndUnloadAsync().catch(() => {});
-            Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
+          // A stray tap outside shouldn't lose a memo: save anything longer than 2s
+          if (recRef.current && secondsRef.current >= 2) {
+            stopAndUpload();
+            return;
+          }
+          if (recRef.current) {
+            recRef.current.stopAndUnloadAsync().catch(() => {});
+            recRef.current = null;
+            resetAudioMode();
           }
           cleanup();
           onClose();
