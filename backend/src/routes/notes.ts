@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { db } from "../services/db.js";
-import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
+import { notes, commitments, topics, people, notePeople, quotes, tags, noteProjects, projects, users } from "../models/schema.js";
 import { eq, and, desc, ilike, or, sql, inArray, gte, lte, getTableColumns, type SQL } from "drizzle-orm";
 import { enqueueNote, isNoteQueued, draftFollowUp } from "../services/processing.js";
 import { indexNote, semanticNotes } from "../services/semantic.js";
@@ -9,6 +9,10 @@ import { readFile, unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { AppEnv } from "../types.js";
 import { ingestAudioFile, writeTempUpload, IngestError, MIN_AUDIO_BYTES, CLIENT_ID_RE } from "../services/ingest.js";
+import { sanitizeMyNotes } from "../services/myNotes.js";
+import { markStale } from "../services/projects.js";
+import { deleteNoteAudio } from "../services/privacy.js";
+import { loadExportNotes, toMarkdown, toDocx, toPdf, safeFilename } from "../services/export.js";
 
 export function parseRecordedAt(v: unknown): Date {
   const d = typeof v === "string" ? new Date(v) : null;
@@ -24,7 +28,7 @@ async function withRelations<T extends { id: string }>(rows: T[]) {
   if (rows.length === 0) return [];
   const ids = rows.map((n) => n.id);
 
-  const [cRows, tRows, pRows, qRows, tagRows] = await Promise.all([
+  const [cRows, tRows, pRows, qRows, tagRows, prRows] = await Promise.all([
     db.select().from(commitments).where(inArray(commitments.noteId, ids)),
     db.select().from(topics).where(inArray(topics.noteId, ids)),
     db
@@ -34,6 +38,11 @@ async function withRelations<T extends { id: string }>(rows: T[]) {
       .where(inArray(notePeople.noteId, ids)),
     db.select().from(quotes).where(inArray(quotes.noteId, ids)),
     db.select().from(tags).where(inArray(tags.noteId, ids)),
+    db
+      .select({ noteId: noteProjects.noteId, auto: noteProjects.auto, id: projects.id, name: projects.name, color: projects.color })
+      .from(noteProjects)
+      .innerJoin(projects, eq(noteProjects.projectId, projects.id))
+      .where(inArray(noteProjects.noteId, ids)),
   ]);
 
   const group = <R>(list: R[], key: (r: R) => string | null) => {
@@ -52,6 +61,7 @@ async function withRelations<T extends { id: string }>(rows: T[]) {
   const byP = group(pRows, (r) => r.noteId);
   const byQ = group(qRows, (r) => r.noteId);
   const byTag = group(tagRows, (r) => r.noteId);
+  const byProject = group(prRows, (r) => r.noteId);
 
   return rows.map((note) => {
     // The same person can be linked twice on older notes; dedupe for display
@@ -59,8 +69,12 @@ async function withRelations<T extends { id: string }>(rows: T[]) {
     const notePeopleList = (byP.get(note.id) ?? [])
       .map((r) => r.person)
       .filter((p) => (seen.has(p.id) ? false : (seen.add(p.id), true)));
+    const audioDeleted = !!(note as { audioDeletedAt?: Date | null }).audioDeletedAt;
     return {
       ...note,
+      // Deleted audio: clients treat an empty audioUrl as "no audio"
+      ...(audioDeleted ? { audioUrl: "" } : {}),
+      projects: (byProject.get(note.id) ?? []).map(({ noteId: _n, ...p }) => p),
       commitments: byC.get(note.id) ?? [],
       topics: (byT.get(note.id) ?? []).map((t) => t.label),
       people: notePeopleList,
@@ -126,6 +140,7 @@ app.post("/", async (c) => {
       duration: Math.max(0, parseFloat((body["duration"] as string) || "0") || 0),
       personId: typeof body["personId"] === "string" && body["personId"] ? body["personId"] : null,
       recordedAt: parseRecordedAt(body["recordedAt"]),
+      myNotes: sanitizeMyNotes(body["myNotes"]),
     });
     if (result.status === "duplicate") {
       return c.json({ id: result.id, status: result.processing ? "processing" : "done", duplicate: true }, 200);
@@ -311,6 +326,7 @@ async function searchNotes(userId: string, q: string, opts: {
       ilike(notes.title, p),
       ilike(notes.summary, p),
       ilike(notes.transcript, p),
+      sql`${notes.myNotes}::text ilike ${p}`,
       sql`exists (select 1 from ${tags} where ${tags.noteId} = ${notes.id} and ${tags.label} ilike ${p})`,
       sql`exists (select 1 from ${topics} where ${topics.noteId} = ${notes.id} and ${topics.label} ilike ${p})`,
       sql`exists (select 1 from ${notePeople} np join ${people} pp on pp.id = np.person_id where np.note_id = ${notes.id} and pp.name ilike ${p})`,
@@ -333,6 +349,7 @@ async function searchNotes(userId: string, q: string, opts: {
     const summary = (note.summary || "").toLowerCase();
     const transcript = (note.transcript || "").toLowerCase();
     const labels = [...note.tags.map((t) => t.label), ...note.topics, ...note.people.map((p) => p.name)].join(" ").toLowerCase();
+    const mine = (note.myNotes ?? []).map((n) => n.text).join(" ").toLowerCase();
 
     let transcriptMatches = 0;
     let score = 0;
@@ -341,6 +358,7 @@ async function searchNotes(userId: string, q: string, opts: {
       if (title.includes(t)) { score += 10; matchedIn.add("title"); }
       if (labels.includes(t)) { score += 6; matchedIn.add("tags"); }
       if (summary.includes(t)) { score += 4; matchedIn.add("summary"); }
+      if (mine.includes(t)) { score += 8; matchedIn.add("my notes"); }
       const n = countOccurrences(transcript, t);
       if (n > 0) { score += Math.min(n, 10); matchedIn.add("transcript"); }
       transcriptMatches += n;
@@ -492,6 +510,11 @@ app.patch("/:id", async (c) => {
   if (typeof body.summary === "string") updates.summary = body.summary;
   if (typeof body.isPinned === "boolean") updates.isPinned = body.isPinned;
   if (typeof body.isArchived === "boolean") updates.isArchived = body.isArchived;
+  // Notes and bookmarks: { myNotes: [{ id, t, text, mark? }] } replaces the list
+  if (Array.isArray(body.myNotes)) {
+    const clean = sanitizeMyNotes(body.myNotes);
+    updates.myNotes = clean.length ? clean : null;
+  }
 
   // Rename speakers: { speakers: { "B": "Sarah" } }
   let renamed: [string, string][] = [];
@@ -525,6 +548,8 @@ app.patch("/:id", async (c) => {
 
   if (!updated) return c.json({ error: "Not found" }, 404);
 
+  if (updates.myNotes !== undefined && !updated.isProcessing) indexNote(noteId).catch(() => {});
+
   if (renamed.length) {
     // Keep quotes attributed to the new name, and refresh search passages
     for (const [from, to] of renamed) {
@@ -549,6 +574,7 @@ app.get("/:id/audio", async (c) => {
 
   if (!note) return c.json({ error: "Not found" }, 404);
   if (!note.audioUrl) return c.json({ error: "No audio" }, 404);
+  if (note.audioDeletedAt) return c.json({ error: "The audio for this recording was deleted." }, 410);
 
   try {
     const data = await readFile(fileURLToPath(note.audioUrl));
@@ -580,6 +606,7 @@ app.post("/:id/reprocess", async (c) => {
 
   if (!note) return c.json({ error: "Not found" }, 404);
   if (!note.audioUrl && !note.transcript.trim()) return c.json({ error: "Nothing to process" }, 400);
+  if (body?.retranscribe && note.audioDeletedAt) return c.json({ error: "The audio was deleted, so this recording can't be re-transcribed." }, 400);
   if (isNoteQueued(noteId)) return c.json({ error: "This note is already being processed." }, 409);
 
   await db
@@ -639,6 +666,8 @@ app.delete("/:id", async (c) => {
   const noteId = c.req.param("id");
   if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
 
+  const inProjects = (await db.select({ projectId: noteProjects.projectId }).from(noteProjects).where(eq(noteProjects.noteId, noteId)))
+    .map((r) => r.projectId);
   const [deleted] = await db
     .delete(notes)
     .where(and(eq(notes.id, noteId), eq(notes.userId, userId)))
@@ -647,7 +676,55 @@ app.delete("/:id", async (c) => {
   if (deleted?.audioUrl?.startsWith("file://")) {
     await unlink(fileURLToPath(deleted.audioUrl)).catch(() => {});
   }
+  if (deleted && inProjects.length) markStale(inProjects);
   return c.json({ ok: true });
+});
+
+// Delete only the audio, keeping transcript and analysis: DELETE /notes/:id/audio
+app.delete("/:id/audio", async (c) => {
+  const userId = c.get("userId") as string;
+  const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const [note] = await db.select({ id: notes.id, isProcessing: notes.isProcessing }).from(notes).where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  if (!note) return c.json({ error: "Not found" }, 404);
+  if (note.isProcessing || isNoteQueued(noteId)) return c.json({ error: "Wait for processing to finish first." }, 409);
+  await deleteNoteAudio(noteId);
+  return c.json({ ok: true });
+});
+
+// Download: GET /notes/:id/export?format=md|docx|pdf&transcript=1
+app.get("/:id/export", async (c) => {
+  const userId = c.get("userId") as string;
+  const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const format = c.req.query("format") ?? "md";
+  if (!["md", "docx", "pdf"].includes(format)) return c.json({ error: "Unknown format" }, 400);
+  const [note] = await loadExportNotes(userId, [noteId]);
+  if (!note) return c.json({ error: "Not found" }, 404);
+  const [user] = await db.select({ timezone: users.timezone }).from(users).where(eq(users.id, userId));
+  const tz = c.req.query("tz") || user?.timezone || "UTC";
+  const opts = { transcript: c.req.query("transcript") === "1", timeZone: tz };
+
+  let body: Buffer | string;
+  let type: string;
+  if (format === "docx") {
+    body = await toDocx(note, opts);
+    type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  } else if (format === "pdf") {
+    body = await toPdf(note, opts);
+    type = "application/pdf";
+  } else {
+    body = toMarkdown(note, opts);
+    type = "text/markdown; charset=utf-8";
+  }
+  const filename = safeFilename(note.title, format);
+  return new Response(typeof body === "string" ? body : new Uint8Array(body), {
+    headers: {
+      "Content-Type": type,
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Cache-Control": "no-store",
+    },
+  });
 });
 
 // Add tag to note

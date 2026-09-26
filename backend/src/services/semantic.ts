@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "./db.js";
 import { noteChunks, notePeople, notes, topics } from "../models/schema.js";
 import { getOpenAI, withRetry } from "./ai.js";
+import { myNotesText } from "./myNotes.js";
 
 /**
  * Search by meaning. Each conversation is split into short passages (with speaker
@@ -41,6 +42,7 @@ function passagesFor(note: NoteRow, topicLabels: string[]): { start: number | nu
     note.meetingTitle && `Meeting: ${note.meetingTitle}`,
     note.summary && `Summary: ${note.summary}`,
     topicLabels.length && `Topics: ${topicLabels.join(", ")}`,
+    note.myNotes?.length && `My notes:\n${myNotesText(note.myNotes).slice(0, 1500)}`,
   ].filter(Boolean).join("\n");
   if (header) out.push({ start: null, text: header });
 
@@ -156,7 +158,7 @@ export interface PassageHit {
 }
 
 /** Most similar passages across a user's conversations. */
-export async function searchPassages(userId: string, query: string, opts: { limit?: number; personId?: string | null; minScore?: number } = {}): Promise<PassageHit[]> {
+export async function searchPassages(userId: string, query: string, opts: { limit?: number; personId?: string | null; noteIds?: string[] | null; minScore?: number } = {}): Promise<PassageHit[]> {
   if (!semanticEnabled() || !query.trim()) return [];
   const rows = await userVectors(userId);
   if (rows.length === 0) return [];
@@ -167,6 +169,11 @@ export async function searchPassages(userId: string, query: string, opts: { limi
     allowed = new Set(
       (await db.select({ noteId: notePeople.noteId }).from(notePeople).where(eq(notePeople.personId, opts.personId))).map((r) => r.noteId),
     );
+  }
+
+  if (opts.noteIds) {
+    const scope = new Set(opts.noteIds);
+    allowed = allowed ? new Set([...allowed].filter((id) => scope.has(id))) : scope;
   }
 
   return rows

@@ -128,6 +128,24 @@ function uploadWithProgress(getHeaders, path, formData, { onProgress, signal } =
   })
 }
 
+/** Fetch a file (e.g. an export) with auth; returns { blob, filename }. */
+async function fetchFile(authFetch, path, { timeout = 120000 } = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeout)
+  let r
+  try {
+    r = await authFetch(`${API_BASE}/api${path}`, { signal: controller.signal })
+  } catch (err) {
+    throw toNetworkError(err)
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!r.ok) throw await errorFromResponse(r)
+  const disposition = r.headers.get('Content-Disposition') || ''
+  const filename = /filename="([^"]+)"/.exec(disposition)?.[1] || 'download'
+  return { blob: await r.blob(), filename }
+}
+
 export function useApi() {
   const authFetch = useAuthFetch()
   const getHeaders = useAuthHeaders()
@@ -139,5 +157,6 @@ export function useApi() {
     del: (path, opts) => request(authFetch, path, { ...opts, method: 'DELETE' }),
     upload: (path, formData, opts) => uploadWithProgress(getHeaders, path, formData, opts),
     putRaw: (path, blob, opts) => request(authFetch, path, { timeout: 120000, ...opts, method: 'PUT', raw: blob }),
+    file: (path, opts) => fetchFile(authFetch, path, opts),
   }), [authFetch, getHeaders])
 }

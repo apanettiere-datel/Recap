@@ -97,7 +97,7 @@ sharePublic.get("/shares/:token", async (c) => {
     topics: noteTopics.map((t) => t.label),
     people: [...new Set(notePeopleRows.filter((p) => p.relationship !== "organization").map((p) => p.name))],
     quotes: noteQuotes,
-    hasAudio: share.includeAudio && !!note.audioUrl,
+    hasAudio: share.includeAudio && !!note.audioUrl && !note.audioDeletedAt,
     transcript: share.includeTranscript ? note.transcript : null,
     segments: share.includeTranscript ? note.segments : null,
     speakers: share.includeTranscript ? note.speakers : null,
@@ -107,7 +107,7 @@ sharePublic.get("/shares/:token", async (c) => {
 // Audio with HTTP Range support so browsers can seek
 sharePublic.get("/shares/:token/audio", async (c) => {
   const row = await activeShare(c.req.param("token"));
-  if (!row || !row.share.includeAudio || !row.note.audioUrl) return c.json({ error: "Not available" }, 404);
+  if (!row || !row.share.includeAudio || !row.note.audioUrl || row.note.audioDeletedAt) return c.json({ error: "Not available" }, 404);
   const path = fileURLToPath(row.note.audioUrl);
   let size: number;
   try {

@@ -24,6 +24,8 @@ const Commitments = React.lazy(() => import('./pages/Commitments'))
 const Archive = React.lazy(() => import('./pages/Archive'))
 const Entities = React.lazy(() => import('./pages/Entities'))
 const SharedNote = React.lazy(() => import('./pages/SharedNote'))
+const Projects = React.lazy(() => import('./pages/Projects'))
+const ProjectDetail = React.lazy(() => import('./pages/ProjectDetail'))
 
 function Loading() {
   return (
@@ -54,6 +56,8 @@ function AppRoutes() {
           <Route path="commitments" element={<Commitments />} />
           <Route path="archive" element={<Archive />} />
           <Route path="entities" element={<Entities />} />
+          <Route path="projects" element={<Projects />} />
+          <Route path="projects/:id" element={<ProjectDetail />} />
         </Route>
         {CLERK_KEY && (
           <>

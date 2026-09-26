@@ -35,11 +35,20 @@ export const users = pgTable("users", {
   calendarLastSyncAt: timestamp("calendar_last_sync_at"),
   calendarError: text("calendar_error"),
   prepBriefsEnabled: boolean("prep_briefs_enabled").default(true).notNull(),
+  // Delete recordings' audio (keeping transcripts and summaries) after this many days; null = keep
+  audioRetentionDays: integer("audio_retention_days"),
+  todoistToken: text("todoist_token"),
+  notionToken: text("notion_token"),
+  notionParentId: text("notion_parent_id"),
+  notionParentTitle: text("notion_parent_title"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 /** A timed piece of transcript: start/end seconds and text. */
 export type TranscriptSegment = { s: number; e: number; t: string; k?: string };
+
+/** Something the recorder typed or bookmarked while recording; t = seconds into the recording. */
+export type MyNote = { id: string; t: number | null; text: string; mark?: boolean };
 
 export const notes = pgTable("notes", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -51,6 +60,9 @@ export const notes = pgTable("notes", {
   speakers: jsonb("speakers").$type<Record<string, string>>(),
   calendarEventId: uuid("calendar_event_id"),
   meetingTitle: text("meeting_title"),
+  myNotes: jsonb("my_notes").$type<MyNote[]>(),
+  audioDeletedAt: timestamp("audio_deleted_at"),
+  notionPageUrl: text("notion_page_url"),
   summary: text("summary").default("").notNull(),
   sentiment: text("sentiment").default("").notNull(),
   audioUrl: text("audio_url").notNull(),
@@ -95,6 +107,7 @@ export const commitments = pgTable("commitments", {
   addedToCalendar: boolean("added_to_calendar").default(false).notNull(),
   dueRemindedAt: timestamp("due_reminded_at"),
   overdueRemindedAt: timestamp("overdue_reminded_at"),
+  todoistTaskId: text("todoist_task_id"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -201,6 +214,42 @@ export const shares = pgTable("shares", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
   revokedAt: timestamp("revoked_at"),
 });
+
+export type ProjectStatus = {
+  overview: string;
+  decisions: string[];
+  openQuestions: string[];
+  risks: string[];
+  nextSteps: string[];
+  latest: { noteId: string; title: string; changes: string } | null;
+};
+
+/** A group of conversations about one piece of work (a deal, a client, a rollout). */
+export const projects = pgTable("projects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  description: text("description").default("").notNull(),
+  color: text("color").default("blue").notNull(),
+  status: jsonb("status").$type<ProjectStatus>(),
+  statusUpdatedAt: timestamp("status_updated_at"),
+  statusStale: boolean("status_stale").default(true).notNull(),
+  archivedAt: timestamp("archived_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({
+  userIdx: index("projects_user_idx").on(t.userId),
+}));
+
+export const noteProjects = pgTable("note_projects", {
+  noteId: uuid("note_id").notNull().references(() => notes.id, { onDelete: "cascade" }),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  // Added by the AI rather than by the user
+  auto: boolean("auto").default(false).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({
+  pair: uniqueIndex("note_projects_pair_idx").on(t.noteId, t.projectId),
+  projectIdx: index("note_projects_project_idx").on(t.projectId),
+}));
 
 // Relations
 export const notesRelations = relations(notes, ({ one, many }) => ({

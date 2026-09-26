@@ -37,6 +37,9 @@ export class LiveUploader {
     this.duration = 0
     this.closed = false
     this.stopped = false
+    this.notes = null          // latest notes/bookmarks, sent separately from the audio
+    this.notesSent = null
+    this.notesTimer = null
     this.timer = setInterval(() => this.cut(), PART_INTERVAL_MS)
     this.pump = this.run()
   }
@@ -63,6 +66,26 @@ export class LiveUploader {
     this.pendingBytes += blob.size
     if (durationSecs != null) this.duration = durationSecs
     if (this.pendingBytes >= PART_MAX_BYTES) this.cut()
+  }
+
+  /** Notes and bookmarks typed while recording; saved on the server with the session. */
+  setNotes(notes) {
+    if (this.closed) return
+    this.notes = notes
+    clearTimeout(this.notesTimer)
+    this.notesTimer = setTimeout(() => this.sendNotes(), 1500)
+  }
+
+  async sendNotes(attempt = 0) {
+    const notes = this.notes
+    if (this.closed || !notes || notes === this.notesSent) return
+    try {
+      await this.api.put(`/recordings/${this.session.id}/notes`, { notes })
+      this.notesSent = notes
+    } catch {
+      // The finalize call carries the notes too; keep trying in the background meanwhile
+      if (attempt < 5 && !this.closed) this.notesTimer = setTimeout(() => this.sendNotes(attempt + 1), 5000 * (attempt + 1))
+    }
   }
 
   /** Close the current group of chunks into a numbered part. */
@@ -156,7 +179,8 @@ export class LiveUploader {
     }
     onProgress?.(1)
 
-    const body = { parts: this.parts.length, duration: Math.round(this.duration || 0) }
+    clearTimeout(this.notesTimer)
+    const body = { parts: this.parts.length, duration: Math.round(this.duration || 0), ...(this.notes ? { myNotes: this.notes } : {}) }
     try {
       return await this.api.post(`/recordings/${this.session.id}/finalize`, body, { timeout: 120000 })
     } finally {
@@ -172,6 +196,7 @@ export class LiveUploader {
   close() {
     this.closed = true
     clearInterval(this.timer)
+    clearTimeout(this.notesTimer)
     this.wake?.()
   }
 

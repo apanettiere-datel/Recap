@@ -13,6 +13,8 @@ import usersRoutes from "./routes/users.js";
 import briefingRoutes from "./routes/briefing.js";
 import recordingsRoutes, { recoverAbandonedSessions } from "./routes/recordings.js";
 import calendarRoutes from "./routes/calendar.js";
+import projectRoutes from "./routes/projects.js";
+import integrationRoutes from "./routes/integrations.js";
 import { shareAdmin, sharePublic } from "./routes/shares.js";
 import { backfillEmbeddings } from "./services/semantic.js";
 import { startWeeklyJobs } from "./jobs/weekly.js";
@@ -37,6 +39,8 @@ app.use("*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   allowHeaders: ["Authorization", "Content-Type"],
+  // So the web app can read the file name of exports and downloads
+  exposeHeaders: ["Content-Disposition"],
 }));
 
 // Request logging
@@ -72,6 +76,10 @@ app.use("/api/insights/*", resolveUser);
 app.use("/api/briefing/*", resolveUser);
 app.use("/api/recordings/*", resolveUser);
 app.use("/api/calendar/*", resolveUser);
+app.use("/api/projects", resolveUser);
+app.use("/api/projects/*", resolveUser);
+app.use("/api/integrations", resolveUser);
+app.use("/api/integrations/*", resolveUser);
 app.use("/api/recordings/*", bodyLimit({
   maxSize: 40 * 1024 * 1024,
   onError: (c) => c.json({ error: "Recording part too large" }, 413),
@@ -88,6 +96,8 @@ app.use("/api/notes", bodyLimit({
 app.route("/api/notes", shareAdmin);
 app.route("/api/notes", notesRoutes);
 app.route("/api/calendar", calendarRoutes);
+app.route("/api/projects", projectRoutes);
+app.route("/api/integrations", integrationRoutes);
 app.route("/api/people", peopleRoutes);
 app.route("/api/commitments", commitmentsRoutes);
 app.route("/api/insights", insightsRoutes);
@@ -152,6 +162,39 @@ CREATE TABLE IF NOT EXISTS "shares" (
 );
 `;
 
+const MIGRATION_0008 = `
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "audio_retention_days" integer;
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "todoist_token" text;
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "notion_token" text;
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "notion_parent_id" text;
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "notion_parent_title" text;
+ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "my_notes" jsonb;
+ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "audio_deleted_at" timestamp;
+ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "notion_page_url" text;
+ALTER TABLE "commitments" ADD COLUMN IF NOT EXISTS "todoist_task_id" text;
+CREATE TABLE IF NOT EXISTS "projects" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "user_id" uuid NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
+  "name" text NOT NULL,
+  "description" text DEFAULT '' NOT NULL,
+  "color" text DEFAULT 'blue' NOT NULL,
+  "status" jsonb,
+  "status_updated_at" timestamp,
+  "status_stale" boolean DEFAULT true NOT NULL,
+  "archived_at" timestamp,
+  "created_at" timestamp DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "projects_user_idx" ON "projects" ("user_id");
+CREATE TABLE IF NOT EXISTS "note_projects" (
+  "note_id" uuid NOT NULL REFERENCES "notes"("id") ON DELETE CASCADE,
+  "project_id" uuid NOT NULL REFERENCES "projects"("id") ON DELETE CASCADE,
+  "auto" boolean DEFAULT false NOT NULL,
+  "created_at" timestamp DEFAULT now() NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "note_projects_pair_idx" ON "note_projects" ("note_id", "project_id");
+CREATE INDEX IF NOT EXISTS "note_projects_project_idx" ON "note_projects" ("project_id");
+`;
+
 async function ensureSchema() {
   await db.execute(sql.raw(`
     ALTER TABLE "notes" ADD COLUMN IF NOT EXISTS "processing_stage" text;
@@ -165,6 +208,7 @@ async function ensureSchema() {
     ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "last_digest_sent_at" timestamp;
   `));
   await db.execute(sql.raw(MIGRATION_0007));
+  await db.execute(sql.raw(MIGRATION_0008));
 }
 
 async function startBackgroundWork() {

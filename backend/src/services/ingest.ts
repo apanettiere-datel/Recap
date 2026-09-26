@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "./db.js";
-import { notes, notePeople, people, tags } from "../models/schema.js";
+import { notes, notePeople, people, tags, type MyNote } from "../models/schema.js";
 import { enqueueNote, isNoteQueued } from "./processing.js";
 
 export const UPLOADS_DIR = join(import.meta.dirname, "../../uploads");
@@ -22,6 +22,8 @@ export interface IngestOptions {
   recordedAt: Date;
   /** Label the note, e.g. "recovered" for sessions finalized by the server. */
   tag?: string;
+  /** Notes and bookmarks typed while recording. */
+  myNotes?: MyNote[];
 }
 
 export type IngestResult =
@@ -73,13 +75,20 @@ export async function ingestAudioFile(sourcePath: string, opts: IngestOptions): 
         await rename(sourcePath, existingPath);
         await db
           .update(notes)
-          .set({ isProcessing: true, processingError: null, processingStage: "Queued", processingStartedAt: null, duration: opts.duration || 0 })
+          .set({
+            isProcessing: true, processingError: null, processingStage: "Queued", processingStartedAt: null, duration: opts.duration || 0,
+            ...(opts.myNotes?.length ? { myNotes: opts.myNotes } : {}),
+          })
           .where(eq(notes.id, existing.id));
         enqueueNote(existing.id, userId, { retranscribe: true });
         console.log(`[ingest] replaced audio for ${existing.id} (${existingSize} → ${incomingSize} bytes)`);
         return { status: "replaced", id: existing.id };
       }
       await unlink(sourcePath).catch(() => {});
+      // A retry may carry notes the first upload didn't have
+      if (opts.myNotes?.length) {
+        await db.update(notes).set({ myNotes: opts.myNotes }).where(and(eq(notes.id, existing.id), sql`${notes.myNotes} is null`));
+      }
       return { status: "duplicate", id: existing.id, processing: existing.isProcessing };
     }
   }
@@ -113,6 +122,7 @@ export async function ingestAudioFile(sourcePath: string, opts: IngestOptions): 
         conversationMode: opts.mode,
         recordedAt: opts.recordedAt,
         isProcessing: true,
+        myNotes: opts.myNotes?.length ? opts.myNotes : null,
       })
       .returning({ id: notes.id });
     noteId = note.id;

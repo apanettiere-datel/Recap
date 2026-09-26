@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { AppEnv } from "../types.js";
 import { ingestAudioFile, IngestError, UPLOADS_DIR, CLIENT_ID_RE, findNoteByClientId } from "../services/ingest.js";
 import { extensionFor, parseRecordedAt } from "./notes.js";
+import { sanitizeMyNotes } from "../services/myNotes.js";
+import { db } from "../services/db.js";
+import { notes, type MyNote } from "../models/schema.js";
+import { eq } from "drizzle-orm";
 
 /**
  * Live cloud backup for recordings in progress.
@@ -75,6 +79,21 @@ function metaFromQuery(c: { req: { query: (k: string) => string | undefined } },
   };
 }
 
+async function readMyNotes(dir: string): Promise<MyNote[]> {
+  try {
+    return sanitizeMyNotes(JSON.parse(await readFile(join(dir, "mynotes.json"), "utf8")));
+  } catch {
+    return [];
+  }
+}
+
+async function writeMyNotes(dir: string, myNotes: MyNote[]) {
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `mynotes.${Date.now()}.tmp`);
+  await writeFile(tmp, JSON.stringify(myNotes));
+  await rename(tmp, join(dir, "mynotes.json"));
+}
+
 /** Concatenate parts [0..count) into one file and turn it into a note. */
 async function assemble(meta: SessionMeta, dir: string, count: number, tag?: string) {
   const out = join(dir, `assembled.${Date.now()}`);
@@ -99,6 +118,7 @@ async function assemble(meta: SessionMeta, dir: string, count: number, tag?: str
     personId: meta.personId,
     recordedAt: new Date(meta.recordedAt),
     tag,
+    myNotes: await readMyNotes(dir),
   });
   await rm(dir, { recursive: true, force: true }).catch(() => {});
   return result;
@@ -137,6 +157,25 @@ app.put("/:sessionId/parts/:index", async (c) => {
   return c.json({ ok: true, index, bytes: data.length });
 });
 
+// Notes and bookmarks typed while recording: PUT /api/recordings/:sessionId/notes { notes }
+// Saved with the session so they survive the device dying, just like the audio.
+app.put("/:sessionId/notes", async (c) => {
+  const userId = c.get("userId") as string;
+  const sessionId = c.req.param("sessionId");
+  if (!CLIENT_ID_RE.test(sessionId)) return c.json({ error: "Not found" }, 404);
+  const body = await c.req.json<{ notes?: unknown }>().catch(() => null);
+  if (!body) return c.json({ error: "Invalid request body" }, 400);
+  const myNotes = sanitizeMyNotes(body.notes);
+
+  const existing = await findNoteByClientId(userId, sessionId);
+  if (existing) {
+    await db.update(notes).set({ myNotes: myNotes.length ? myNotes : null }).where(eq(notes.id, existing.id));
+    return c.json({ ok: true, noteId: existing.id, count: myNotes.length });
+  }
+  await writeMyNotes(sessionDir(userId, sessionId), myNotes);
+  return c.json({ ok: true, count: myNotes.length });
+});
+
 // Which parts does the server have? GET /api/recordings/:sessionId
 app.get("/:sessionId", async (c) => {
   const userId = c.get("userId") as string;
@@ -152,7 +191,7 @@ app.post("/:sessionId/finalize", async (c) => {
   const userId = c.get("userId") as string;
   const sessionId = c.req.param("sessionId");
   if (!CLIENT_ID_RE.test(sessionId)) return c.json({ error: "Not found" }, 404);
-  const body = await c.req.json<{ parts?: number; duration?: number }>().catch(() => ({} as { parts?: number; duration?: number }));
+  const body = await c.req.json<{ parts?: number; duration?: number; myNotes?: unknown }>().catch(() => ({} as { parts?: number; duration?: number; myNotes?: unknown }));
 
   const existing = await findNoteByClientId(userId, sessionId);
   if (existing) return c.json({ id: existing.id, status: existing.isProcessing ? "processing" : "done", duplicate: true });
@@ -168,6 +207,7 @@ app.post("/:sessionId/finalize", async (c) => {
   if (missing.length > 0) return c.json({ error: "Some parts of the recording haven't arrived yet.", missing }, 409);
 
   if (typeof body.duration === "number" && body.duration > 0) meta.duration = body.duration;
+  if (body.myNotes !== undefined) await writeMyNotes(dir, sanitizeMyNotes(body.myNotes));
   try {
     const result = await assemble(meta, dir, expected);
     return c.json({ id: result.id, status: "processing" }, result.status === "created" ? 201 : 200);

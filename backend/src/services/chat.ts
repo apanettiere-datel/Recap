@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { db } from "./db.js";
-import { notes, commitments, people, topics, notePeople } from "../models/schema.js";
+import { notes, commitments, people, noteProjects, projects } from "../models/schema.js";
 import { eq, and, desc, inArray } from "drizzle-orm";
 import { searchPassages } from "./semantic.js";
 
@@ -69,13 +69,13 @@ export interface ChatSource {
 }
 
 /** Transcript passages most relevant to the question, from any conversation. */
-async function retrieve(userId: string, question: string, history: ChatTurn[]) {
+async function retrieve(userId: string, question: string, history: ChatTurn[], noteIds: string[] | null) {
   const lastUser = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
   // Follow-up questions ("what about her?") need the previous question for context
   const query = question.length < 40 && lastUser ? `${lastUser}\n${question}` : question;
   let hits: Awaited<ReturnType<typeof searchPassages>> = [];
   try {
-    hits = await searchPassages(userId, query, { limit: 10, minScore: 0.2 });
+    hits = await searchPassages(userId, query, { limit: 10, minScore: 0.2, noteIds });
   } catch (err) {
     console.warn("[chat] retrieval unavailable:", (err as Error).message);
   }
@@ -97,13 +97,29 @@ async function retrieve(userId: string, question: string, history: ChatTurn[]) {
   return { block: lines.join("\n\n"), sources };
 }
 
-export async function chatWithNotes(userId: string, userMessage: string, history?: unknown): Promise<{ reply: string; sources: ChatSource[] }> {
+export async function chatWithNotes(
+  userId: string,
+  userMessage: string,
+  history?: unknown,
+  opts: { projectId?: string | null } = {},
+): Promise<{ reply: string; sources: ChatSource[] } | null> {
   const turns = sanitizeHistory(history);
-  const retrieved = await retrieve(userId, userMessage, turns);
-  const userNotes = await db
+
+  // Scoped to one project: only its conversations are searched and summarized
+  let project: { name: string; description: string; overview: string } | null = null;
+  let scope: string[] | null = null;
+  if (opts.projectId) {
+    const [p] = await db.select().from(projects).where(and(eq(projects.id, opts.projectId), eq(projects.userId, userId)));
+    if (!p) return null;
+    project = { name: p.name, description: p.description, overview: p.status?.overview ?? "" };
+    scope = (await db.select({ noteId: noteProjects.noteId }).from(noteProjects).where(eq(noteProjects.projectId, p.id))).map((r) => r.noteId);
+  }
+
+  const retrieved = await retrieve(userId, userMessage, turns, scope);
+  const userNotes = scope && scope.length === 0 ? [] : await db
     .select()
     .from(notes)
-    .where(and(eq(notes.userId, userId), eq(notes.isProcessing, false)))
+    .where(and(eq(notes.userId, userId), eq(notes.isProcessing, false), ...(scope ? [inArray(notes.id, scope)] : [])))
     .orderBy(desc(notes.recordedAt))
     .limit(50);
 
@@ -154,7 +170,7 @@ IMPORTANT RULES:
 - If the user has no conversations recorded yet, tell them: "You don't have any recorded conversations yet. Start by recording a conversation and I'll be able to help you find information."
 - Be concise and direct. Reference specific conversations by title and date when relevant.
 - If you mention a specific note, format it as [Title, Date] so the app can link to it.
-
+${project ? `\nThe user is asking about their project "${project.name}"${project.description ? ` (${project.description})` : ""}. Only the conversations filed under this project are included below.${project.overview ? `\nCurrent project status: ${project.overview}` : ""}\n` : ""}
 ${userNotes.length === 0 ? "The user has NO recorded conversations yet." : `User's conversation history (${userNotes.length} conversations):\n${notesContext}`}
 
 ${userPeople.length === 0 ? "The user has NO people in their contacts yet." : `People the user talks to:\n${peopleContext}`}

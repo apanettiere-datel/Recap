@@ -23,7 +23,7 @@ function sleep(ms, signal) {
  * `clientId` makes the upload idempotent: if a retry follows an upload whose
  * response was lost, the server returns the note it already created.
  */
-export async function uploadRecording(api, { blob, clientId, mode = 'conversation', duration = 0, personId, recordedAt }, { onProgress, onRetry, signal } = {}) {
+export async function uploadRecording(api, { blob, clientId, mode = 'conversation', duration = 0, personId, recordedAt, myNotes }, { onProgress, onRetry, signal } = {}) {
   if (!blob || blob.size === 0) throw new ApiError('The recording is empty — no audio was captured.', { status: 400 })
 
   let lastError
@@ -42,6 +42,7 @@ export async function uploadRecording(api, { blob, clientId, mode = 'conversatio
     if (clientId) formData.append('clientId', clientId)
     if (recordedAt) formData.append('recordedAt', recordedAt)
     if (personId) formData.append('personId', personId)
+    if (myNotes?.length) formData.append('myNotes', JSON.stringify(myNotes))
 
     try {
       onProgress?.(0)

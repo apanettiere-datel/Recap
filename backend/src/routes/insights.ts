@@ -65,7 +65,7 @@ app.post("/reports/generate", async (c) => {
 // Chat with notes
 app.post("/chat", async (c) => {
   const userId = c.get("userId") as string;
-  const body = await c.req.json<{ message: string; noteId?: string; history?: unknown }>().catch(() => null);
+  const body = await c.req.json<{ message: string; noteId?: string; projectId?: string; history?: unknown }>().catch(() => null);
   const message = body?.message?.trim().slice(0, 4000);
 
   if (!message) return c.json({ error: "Message required" }, 400);
@@ -77,7 +77,10 @@ app.post("/chat", async (c) => {
       if (reply === null) return c.json({ error: "Conversation not found" }, 404);
       return c.json({ reply });
     }
-    const { reply, sources } = await chatWithNotes(userId, message, body?.history);
+    const projectId = body?.projectId && /^[0-9a-f-]{36}$/i.test(body.projectId) ? body.projectId : null;
+    const result = await chatWithNotes(userId, message, body?.history, { projectId });
+    if (result === null) return c.json({ error: "Project not found" }, 404);
+    const { reply, sources } = result;
     return c.json({ reply, sources });
   } catch (err) {
     console.error("[chat] failed:", err);

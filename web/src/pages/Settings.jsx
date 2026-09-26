@@ -1,13 +1,21 @@
 import { useTheme } from '@/lib/theme'
-import { useApi, API_BASE } from '@/lib/api'
+import { API_BASE } from '@/lib/api'
 import { toast } from '@/lib/toast'
 import WeeklyEmailSettings from '@/components/WeeklyEmailSettings'
 import { VocabularySettings, ReminderSettings, CalendarSettings } from '@/components/SmartSettings'
+import { IntegrationSettings, PrivacySettings } from '@/components/DataSettings'
 import { useAuthFetch } from '@/lib/authFetch'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useClerk } from '@clerk/clerk-react'
 
 const CLERK_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
+
+/** After the account is deleted, sign out (the Clerk hook only exists with Clerk configured). */
+function ClerkPrivacySettings() {
+  const { signOut } = useClerk()
+  return <PrivacySettings onSignOut={() => signOut({ redirectUrl: '/' })} />
+}
 
 function ClerkSignOut() {
   const { signOut } = useClerk()
@@ -27,11 +35,16 @@ function ClerkSignOut() {
 
 export default function Settings() {
   const { mode, setMode } = useTheme()
-  const api = useApi()
   const authFetch = useAuthFetch()
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
-  const [deleting, setDeleting] = useState(false)
   const [exporting, setExporting] = useState(null)
+  const location = useLocation()
+
+  // Deep links like /settings#integrations
+  useEffect(() => {
+    if (!location.hash) return
+    const t = setTimeout(() => document.getElementById(location.hash.slice(1))?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 150)
+    return () => clearTimeout(t)
+  }, [location.hash])
 
   const handleExport = async (type) => {
     setExporting(type)
@@ -54,18 +67,6 @@ export default function Settings() {
       toast.error("Couldn't export. Check your connection and try again.")
     }
     setExporting(null)
-  }
-
-  const handleDeleteAll = async () => {
-    setDeleting(true)
-    try {
-      await api.del('/users')
-    } catch {
-      // ignore
-    }
-    setDeleting(false)
-    setShowDeleteConfirm(false)
-    window.location.reload()
   }
 
   const themeOptions = [
@@ -133,6 +134,13 @@ export default function Settings() {
           <VocabularySettings />
         </div>
 
+        <div id="integrations" className="scroll-mt-20">
+          <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+            Connected apps
+          </h2>
+          <IntegrationSettings />
+        </div>
+
         {/* Export Data */}
         <div>
           <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
@@ -169,46 +177,20 @@ export default function Settings() {
         </div>
 
         {/* Account */}
-        <div>
+        {CLERK_KEY && <div>
           <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
             Account
           </h2>
           <div className="space-y-3">
-            {CLERK_KEY && <ClerkSignOut />}
-
-            {showDeleteConfirm ? (
-              <div className="bg-red-500/10 rounded-2xl p-4 text-center">
-                <p className="text-sm text-red-500 font-medium mb-3">
-                  This will permanently delete all your data. This action cannot be undone.
-                </p>
-                <div className="flex items-center justify-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowDeleteConfirm(false)}
-                    className="px-4 py-2 rounded-xl text-sm font-medium text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleDeleteAll}
-                    disabled={deleting}
-                    className="px-4 py-2 rounded-xl bg-red-500 text-white text-sm font-medium hover:bg-red-600 transition-colors disabled:opacity-50"
-                  >
-                    {deleting ? 'Deleting...' : 'Delete Everything'}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setShowDeleteConfirm(true)}
-                className="w-full py-3 rounded-2xl text-red-500 text-sm font-medium hover:bg-red-500/10 transition-colors border border-neutral-200 dark:border-neutral-800"
-              >
-                Delete All Data
-              </button>
-            )}
+            <ClerkSignOut />
           </div>
+        </div>}
+
+        <div id="privacy" className="scroll-mt-20">
+          <h2 className="text-sm font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+            Privacy &amp; data
+          </h2>
+          {CLERK_KEY ? <ClerkPrivacySettings /> : <PrivacySettings />}
         </div>
 
         {/* Version */}

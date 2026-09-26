@@ -56,6 +56,7 @@ export default function Chat() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const noteId = searchParams.get('noteId')
+  const projectId = noteId ? null : searchParams.get('projectId')
   const openSource = (s) => navigate(`/note/${s.noteId}${s.start != null ? `?t=${Math.floor(s.start)}` : ''}`)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -73,10 +74,16 @@ export default function Chat() {
     enabled: !!noteId,
   })
 
+  const { data: project } = useQuery({
+    queryKey: ['project', projectId],
+    queryFn: () => api.get(`/projects/${projectId}`),
+    enabled: !!projectId,
+  })
+
   const sendMutation = useMutation({
     meta: { silent: true }, // errors are shown in the thread
     mutationFn: ({ message, history }) =>
-      api.post('/insights/chat', { message, history, ...(noteId && { noteId }) }, { timeout: 90000 }),
+      api.post('/insights/chat', { message, history, ...(noteId && { noteId }), ...(projectId && { projectId }) }, { timeout: 90000 }),
     onSuccess: (data) => {
       setMessages((prev) => [
         ...prev,
@@ -109,7 +116,12 @@ export default function Chat() {
   }, [messages])
 
   // Generate personalized example prompts based on people data
-  const examplePrompts = noteId ? [
+  const examplePrompts = projectId ? [
+    'Where does this project stand?',
+    'What have we decided so far?',
+    'What is still open, and who owns it?',
+    'What changed since the last conversation?',
+  ] : noteId ? [
     'What were the action items and who owns them?',
     'What decisions were made?',
     'What questions were left open?',
@@ -152,6 +164,11 @@ export default function Chat() {
                 About: {note?.title || 'this conversation'}
               </p>
             )}
+            {projectId && (
+              <p className="text-xs text-neutral-500 dark:text-neutral-400 truncate">
+                Project: {project?.name || '…'}
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -166,7 +183,7 @@ export default function Chat() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 9.75a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375m-13.5 3.01c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.184-4.183a1.14 1.14 0 01.778-.332 48.294 48.294 0 005.83-.498c1.585-.233 2.708-1.626 2.708-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
                 </svg>
               </div>
-              <h2 className="text-lg font-semibold text-neutral-900 dark:text-white mb-2">{noteId ? 'Ask about this conversation' : 'Ask Recap anything'}</h2>
+              <h2 className="text-lg font-semibold text-neutral-900 dark:text-white mb-2">{noteId ? 'Ask about this conversation' : projectId ? 'Ask about this project' : 'Ask Recap anything'}</h2>
               <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-6 text-center max-w-xs">
                 Get insights about your conversations, commitments, and relationships.
               </p>

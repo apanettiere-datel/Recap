@@ -1,11 +1,13 @@
 import { Hono } from "hono";
 import { db } from "../services/db.js";
-import { users, notes, commitments, people, insights, weeklyReports } from "../models/schema.js";
+import { users } from "../models/schema.js";
 import { eq } from "drizzle-orm";
 
 import { AppEnv } from "../types.js";
 import { buildDigest, isValidTimezone } from "../services/digest.js";
 import { sendEmail, isEmailConfigured, isValidEmail, EmailNotConfiguredError } from "../services/email.js";
+import { RETENTION_CHOICES, deleteAuthAccount, deleteUserData, purgeExpiredAudio } from "../services/privacy.js";
+import { buildDataArchive } from "../services/export.js";
 const app = new Hono<AppEnv>();
 
 function digestSettings(user: typeof users.$inferSelect) {
@@ -123,6 +125,38 @@ app.patch("/me/reminders", async (c) => {
   return c.json({ enabled: updated.remindersEnabled, hour: updated.reminderHour, timezone: updated.timezone, email: updated.digestEmail || updated.email || "", emailConfigured: isEmailConfigured() });
 });
 
+// Privacy: how long to keep recordings' audio
+app.get("/me/privacy", async (c) => {
+  const user = await currentUser(c.get("userId"));
+  if (!user) return c.json({ error: "User not found" }, 404);
+  return c.json({ audioRetentionDays: user.audioRetentionDays, choices: RETENTION_CHOICES });
+});
+
+app.patch("/me/privacy", async (c) => {
+  const body = await c.req.json<{ audioRetentionDays?: number | null }>().catch(() => null);
+  if (!body || !("audioRetentionDays" in body)) return c.json({ error: "Invalid request body" }, 400);
+  const days = body.audioRetentionDays;
+  if (days !== null && !RETENTION_CHOICES.includes(days as never)) return c.json({ error: "Choose one of the offered periods." }, 400);
+  const [updated] = await db.update(users).set({ audioRetentionDays: days }).where(eq(users.id, c.get("userId"))).returning();
+  // Apply straight away rather than waiting for the hourly job
+  if (days) purgeExpiredAudio().catch((e) => console.error("[privacy] purge failed:", e));
+  return c.json({ audioRetentionDays: updated.audioRetentionDays, choices: RETENTION_CHOICES });
+});
+
+// Download everything as a ZIP (data.json + a Markdown file per conversation)
+app.get("/me/export", async (c) => {
+  const zip = await buildDataArchive(c.get("userId"));
+  const day = new Date().toISOString().slice(0, 10);
+  return new Response(new Uint8Array(zip), {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="recap-export-${day}.zip"`,
+      "Content-Length": String(zip.byteLength),
+      "Cache-Control": "no-store",
+    },
+  });
+});
+
 app.get("/me/digest/preview", async (c) => {
   const digest = await buildDigest(c.get("userId"));
   return c.json(digest);
@@ -169,7 +203,8 @@ app.post("/sync", async (c) => {
   return c.json(created);
 });
 
-// Delete account and all data
+// Delete all data (recordings, audio files, people, everything).
+// DELETE /api/users?account=1 also deletes the sign-in account itself.
 app.delete("/", async (c) => {
   const firebaseUid = c.get("firebaseUid") as string;
 
@@ -181,15 +216,20 @@ app.delete("/", async (c) => {
 
   if (!user) return c.json({ error: "User not found" }, 404);
 
-  const userId = user.id;
-  await db.delete(weeklyReports).where(eq(weeklyReports.userId, userId));
-  await db.delete(insights).where(eq(insights.userId, userId));
-  await db.delete(commitments).where(eq(commitments.userId, userId));
-  await db.delete(people).where(eq(people.userId, userId));
-  await db.delete(notes).where(eq(notes.userId, userId));
-  await db.delete(users).where(eq(users.id, userId));
+  const deleteAccount = c.req.query("account") === "1";
+  await deleteUserData(user.id, { keepAccount: !deleteAccount });
 
-  return c.json({ ok: true });
+  let accountDeleted = false;
+  if (deleteAccount) {
+    try {
+      accountDeleted = await deleteAuthAccount(firebaseUid);
+    } catch (err) {
+      console.error("[account] could not delete sign-in account:", err);
+      return c.json({ ok: true, accountDeleted: false, error: "Your data was deleted, but the sign-in account couldn't be removed. Try again, or contact support." }, 502);
+    }
+  }
+  console.log(`[account] deleted ${deleteAccount ? "account and " : ""}all data for user ${user.id}`);
+  return c.json({ ok: true, accountDeleted });
 });
 
 export default app;

@@ -121,7 +121,7 @@ app.get("/:id", async (c) => {
         isProcessing: notes.isProcessing,
         processingError: notes.processingError,
         isArchived: notes.isArchived,
-        hasAudio: sql<boolean>`${notes.audioUrl} <> ''`,
+        hasAudio: sql<boolean>`${notes.audioUrl} <> '' and ${notes.audioDeletedAt} is null`,
       },
     })
     .from(notePeople)

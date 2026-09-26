@@ -7,6 +7,7 @@ import { buildDigest, localDayHour } from "../services/digest.js";
 import { sendEmail, isEmailConfigured } from "../services/email.js";
 import { sendDueReminders } from "../services/reminders.js";
 import { syncAllCalendars, sendPrepBriefs } from "../services/calendar.js";
+import { purgeExpiredAudio } from "../services/privacy.js";
 
 /**
  * Send weekly summaries that are due. Each user picks a weekday and hour in their own
@@ -85,6 +86,11 @@ export function startWeeklyJobs() {
   });
   cron.schedule("*/5 * * * *", () => {
     sendPrepBriefs().catch((err) => console.error("[cron] Prep briefs failed:", err));
+  });
+
+  // Audio retention: delete recordings' audio past each user's chosen period
+  cron.schedule("23 * * * *", () => {
+    purgeExpiredAudio().catch((err) => console.error("[cron] Audio retention job failed:", err));
   });
 
   console.log("[cron] Weekly email summaries: hourly check");

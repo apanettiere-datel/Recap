@@ -13,6 +13,10 @@ import ProcessingStatus from '@/components/ProcessingStatus'
 import TranscriptViewer from '@/components/TranscriptViewer'
 import FollowUpEmail from '@/components/FollowUpEmail'
 import ShareLinkDialog from '@/components/ShareLinkDialog'
+import MyNotesSection from '@/components/MyNotesSection'
+import NoteProjects from '@/components/NoteProjects'
+import ExportDialog from '@/components/ExportDialog'
+import { downloadBlob, extensionForMime } from '@/lib/uploadRecording'
 
 export default function NoteDetail() {
   const { id } = useParams()
@@ -32,6 +36,7 @@ export default function NoteDetail() {
   const [showMenu, setShowMenu] = useState(false)
   const [showFollowUp, setShowFollowUp] = useState(false)
   const [showShareLink, setShowShareLink] = useState(false)
+  const [showExport, setShowExport] = useState(false)
   const [tagInput, setTagInput] = useState('')
   const [showTagInput, setShowTagInput] = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
@@ -138,6 +143,36 @@ export default function NoteDetail() {
       toast.success('Speaker renamed')
     },
   })
+
+  const saveMyNotes = useMutation({
+    mutationFn: (myNotes) => api.patch(`/notes/${id}`, { myNotes }),
+    onMutate: (myNotes) => {
+      const previous = queryClient.getQueryData(['note', id])
+      queryClient.setQueryData(['note', id], (prev) => (prev ? { ...prev, myNotes } : prev))
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(['note', id], context.previous)
+    },
+  })
+
+  const deleteAudio = useMutation({
+    mutationFn: () => api.del(`/notes/${id}/audio`),
+    onSuccess: () => {
+      invalidateNote()
+      toast.success('Audio deleted. The transcript and summary are kept.')
+    },
+  })
+
+  const downloadAudio = async () => {
+    try {
+      const blob = await fetch(audio.url).then((r) => r.blob())
+      const stamp = new Date(note.recordedAt).toISOString().slice(0, 10)
+      downloadBlob(blob, `${(note.title || 'recording').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'recording'}-${stamp}.${extensionForMime(blob.type)}`)
+    } catch {
+      toast.error("Couldn't download the audio.")
+    }
+  }
 
   const addTag = useMutation({
     mutationFn: (label) => api.post(`/notes/${id}/tags`, { label }),
@@ -247,6 +282,7 @@ export default function NoteDetail() {
                 <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
                 <div className="absolute right-0 top-11 z-20 w-56 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl py-1.5 text-sm">
                   <MenuItem onClick={() => { setShowMenu(false); setTitleDraft(note.title || ''); setEditingTitle(true) }}>Rename</MenuItem>
+                  {!note.isProcessing && <MenuItem onClick={() => { setShowMenu(false); setShowExport(true) }}>Export & send…</MenuItem>}
                   {!note.isProcessing && <MenuItem onClick={() => { setShowMenu(false); setShowShareLink(true) }}>Share link…</MenuItem>}
                   <MenuItem onClick={() => { setShowMenu(false); toggleArchive.mutate() }}>{note.isArchived ? 'Unarchive' : 'Archive'}</MenuItem>
                   {!note.isProcessing && (note.audioUrl || hasTranscript) && (
@@ -255,7 +291,21 @@ export default function NoteDetail() {
                   {!note.isProcessing && note.audioUrl && (
                     <MenuItem onClick={() => { setShowMenu(false); reprocess.mutate(true) }}>Re-transcribe audio</MenuItem>
                   )}
+                  {audio.status === 'ready' && (
+                    <MenuItem onClick={() => { setShowMenu(false); downloadAudio() }}>Download audio</MenuItem>
+                  )}
                   <div className="my-1 border-t border-neutral-100 dark:border-neutral-800" />
+                  {!note.isProcessing && note.audioUrl && (
+                    <MenuItem
+                      danger
+                      onClick={() => {
+                        setShowMenu(false)
+                        if (window.confirm('Delete the audio recording? The transcript, summary and everything else are kept. This cannot be undone.')) deleteAudio.mutate()
+                      }}
+                    >
+                      Delete audio only
+                    </MenuItem>
+                  )}
                   <MenuItem
                     danger
                     onClick={() => {
@@ -318,6 +368,14 @@ export default function NoteDetail() {
           )}
         </div>
 
+        <NoteProjects noteId={id} projects={note.projects} />
+
+        {note.audioDeletedAt && (
+          <p className="mb-6 text-xs text-neutral-500 dark:text-neutral-400 rounded-xl bg-neutral-100 dark:bg-neutral-900 px-3 py-2">
+            The audio was deleted {formatFullDate(note.audioDeletedAt)}. The transcript and summary are kept.
+          </p>
+        )}
+
         {note.audioUrl && (
           <div id="note-audio" className="mb-6 sticky top-[57px] z-[6] -mx-1 px-1 py-1 bg-neutral-50/90 dark:bg-black/90 backdrop-blur">
             {audio.status === 'ready' ? (
@@ -361,6 +419,19 @@ export default function NoteDetail() {
               Ask about this conversation
             </button>
           </div>
+        )}
+
+        {(!note.isProcessing || note.myNotes?.length > 0) && (
+          <MyNotesSection
+            notes={note.myNotes}
+            currentTime={audio.status === 'ready' ? playTime : null}
+            canSeek={audio.status === 'ready'}
+            onSeek={seekTo}
+            onSave={(myNotes) => saveMyNotes.mutate(myNotes)}
+            saving={saveMyNotes.isPending}
+            onUpdateSummary={!note.isProcessing && (note.audioUrl || hasTranscript) ? () => reprocess.mutate(false) : undefined}
+            updatingSummary={reprocess.isPending}
+          />
         )}
 
         {note.commitments?.length > 0 && (
@@ -534,6 +605,7 @@ export default function NoteDetail() {
 
       <ShareSheet open={showShare} onClose={() => setShowShare(false)} note={note} />
       {showFollowUp && <FollowUpEmail noteId={id} onClose={() => setShowFollowUp(false)} />}
+      {showExport && <ExportDialog note={note} onClose={() => setShowExport(false)} />}
       {showShareLink && <ShareLinkDialog noteId={id} hasAudio={!!note.audioUrl} onClose={() => setShowShareLink(false)} />}
     </div>
   )

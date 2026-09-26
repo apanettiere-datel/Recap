@@ -77,6 +77,7 @@ function PendingItem({ session, state, setState }) {
         duration: session.duration || 0,
         personId: session.personId,
         recordedAt: session.startedAt,
+        myNotes: session.myNotes,
       }, {
         onProgress: (progress) => setState({ progress, attempt: 0 }),
         onRetry: (attempt) => setState({ progress: 0, attempt }),

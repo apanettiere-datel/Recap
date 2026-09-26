@@ -11,6 +11,7 @@ import {
 import { uploadRecording, downloadBlob, extensionForMime } from '@/lib/uploadRecording'
 import { LiveUploader } from '@/lib/liveUploader'
 import PendingRecordings from '@/components/PendingRecordings'
+import RecordingNotes from '@/components/RecordingNotes'
 
 const MAX_RECORDING_SECONDS = 2 * 60 * 60 // 2 hours
 const LIMIT_WARNING_SECONDS = MAX_RECORDING_SECONDS - 5 * 60
@@ -58,6 +59,7 @@ export default function Recording() {
   const [cloud, setCloud] = useState(null)
   const [importing, setImporting] = useState(false)
   const [upload, setUpload] = useState({ progress: 0, attempt: 0, size: 0 })
+  const [myNotes, setMyNotes] = useState([])
 
   const recorderRef = useRef(null)
   const streamsRef = useRef([])
@@ -78,6 +80,7 @@ export default function Recording() {
   const phaseRef = useRef('choose')
   const limitWarnedRef = useRef(false)
   const liveRef = useRef(null)
+  const myNotesRef = useRef([])
 
   const go = (p) => { phaseRef.current = p; setPhase(p) }
 
@@ -239,6 +242,8 @@ export default function Recording() {
     segmentStartRef.current = Date.now()
     lastSoundAtRef.current = Date.now()
     limitWarnedRef.current = false
+    myNotesRef.current = []
+    setMyNotes([])
 
     try {
       await createSession(session)
@@ -306,6 +311,16 @@ export default function Recording() {
         finish('You reached the 2-hour limit, so the recording was stopped and saved.')
       }
     }, 250)
+  }
+
+  /** Notes and bookmarks: kept on this device and on the server, like the audio. */
+  function changeNotes(next) {
+    myNotesRef.current = next
+    setMyNotes(next)
+    const session = sessionRef.current
+    if (!session) return
+    updateSession(session.id, { myNotes: next }).catch(() => {})
+    liveRef.current?.setNotes(next)
   }
 
   function pause() {
@@ -425,6 +440,7 @@ export default function Recording() {
         duration: durationSec,
         personId: session.personId,
         recordedAt: session.startedAt,
+        myNotes: myNotesRef.current,
       }, {
         onProgress: (p) => mountedRef.current && setUpload((u) => ({ ...u, progress: p })),
         onRetry: (attempt) => mountedRef.current && setUpload((u) => ({ ...u, attempt, progress: 0 })),
@@ -783,6 +799,7 @@ export default function Recording() {
           <div className="w-14" />
         </div>
         <CloudStatus cloud={cloud} backupOk={backupOk} starting={phase === 'starting'} />
+        <RecordingNotes notes={myNotes} onChange={changeNotes} getTime={() => elapsedMs() / 1000} disabled={phase === 'starting'} />
       </div>
     </Screen>
   )
@@ -821,8 +838,8 @@ function CloudStatus({ cloud, backupOk, starting }) {
 
 function Screen({ children }) {
   return (
-    <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center px-6 overflow-y-auto">
-      {children}
+    <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center px-6 overflow-y-auto">
+      <div className="my-auto w-full flex flex-col items-center pt-[calc(4.5rem+env(safe-area-inset-top,0px))] pb-10">{children}</div>
     </div>
   )
 }

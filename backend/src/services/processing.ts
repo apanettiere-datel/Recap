@@ -13,6 +13,8 @@ import { users } from "../models/schema.js";
 import { identifySpeakers, labeledTranscript, vocabularyPrompt, correctVocabulary, speakerLabels } from "./speakers.js";
 import { findMeetingForRecording, linkMeetingAttendees, type CalendarEvent } from "./calendar.js";
 import { indexNote } from "./semantic.js";
+import { myNotesPrompt } from "./myNotes.js";
+import { assignProjectsFromAnalysis, projectHints } from "./projects.js";
 
 const WHISPER_MAX_BYTES = 24 * 1024 * 1024; // 24MB (Whisper limit is 25MB)
 const MAX_CONCURRENT_NOTES = 2;
@@ -48,9 +50,27 @@ interface AnalysisResult {
   tags: string[];
   quotes: { text: string; speaker: string }[];
   entities: Entity[];
+  /** Names of the user's projects this conversation belongs to. */
+  projects: string[];
 }
 
-type ChunkAnalysis = Omit<AnalysisResult, "title" | "sentiment" | "tags">;
+type ChunkAnalysis = Omit<AnalysisResult, "title" | "sentiment" | "tags" | "projects">;
+
+/** Extra context for the analysis prompt: the recorder's notes and their projects. */
+interface AnalysisContext {
+  myNotes: string;
+  projects: { name: string; description: string }[];
+}
+
+function projectsPrompt(projects: AnalysisContext["projects"]): string {
+  if (projects.length === 0) return "";
+  return `
+## PROJECTS
+The recorder groups conversations into these projects:
+${projects.map((p) => `- "${p.name}"${p.description ? `: ${p.description.slice(0, 300)}` : ""}`).join("\n")}
+Add "projects": ["exact project names from this list"] to the JSON for the projects this conversation is clearly about. Use [] if none clearly fit — never guess.
+`;
+}
 
 type KnownPerson = { name: string; keywords: string[]; relationship: string };
 
@@ -163,7 +183,7 @@ export async function processNote(noteId: string, userId: string, opts: { retran
     let transcript = note.transcript ?? "";
     let segments = note.segments ?? [];
     let speakers = note.speakers ?? null;
-    const needsTranscription = !!note.audioUrl && (opts.retranscribe || !transcript.trim());
+    const needsTranscription = !!note.audioUrl && !note.audioDeletedAt && (opts.retranscribe || !transcript.trim());
 
     const [user] = await db.select().from(users).where(eq(users.id, userId));
     const knownPeople = await db.select().from(people).where(eq(people.userId, userId));
@@ -255,12 +275,19 @@ export async function processNote(noteId: string, userId: string, opts: { retran
         .filter((n) => !knownPeople.some((p) => p.name.toLowerCase() === n.toLowerCase()))
         .map((name) => ({ name, keywords: [] as string[], relationship: "meeting attendee" })),
     ];
+    const context: AnalysisContext = {
+      // Read fresh: notes can be edited while the audio is being transcribed
+      myNotes: myNotesPrompt((await db.select({ myNotes: notes.myNotes }).from(notes).where(eq(notes.id, noteId)))[0]?.myNotes, segments, speakers),
+      projects: await projectHints(userId).catch(() => []),
+    };
     const analysis = labeled.length > MAP_REDUCE_THRESHOLD_CHARS
-      ? await analyzeLongTranscript(labeled, note.conversationMode, peopleForAnalysis)
-      : await analyzeTranscript(labeled, note.conversationMode, peopleForAnalysis);
+      ? await analyzeLongTranscript(labeled, note.conversationMode, peopleForAnalysis, context)
+      : await analyzeTranscript(labeled, note.conversationMode, peopleForAnalysis, context);
 
     await setStage(noteId, "Saving results");
     await saveAnalysis(noteId, userId, note.recordedAt, analysis);
+    await assignProjectsFromAnalysis(userId, noteId, analysis.projects)
+      .catch((e) => console.warn("[processNote] project assignment failed:", (e as Error).message));
 
     if (meeting) {
       await linkMeetingAttendees(userId, noteId, meeting).catch((e) => console.warn("[processNote] linking attendees failed:", e));
@@ -620,7 +647,7 @@ function splitTranscript(text: string, maxChars: number): string[] {
   return pieces;
 }
 
-async function analyzeLongTranscript(transcript: string, mode: string, knownPeople: KnownPerson[]): Promise<AnalysisResult> {
+async function analyzeLongTranscript(transcript: string, mode: string, knownPeople: KnownPerson[], context: AnalysisContext): Promise<AnalysisResult> {
   const today = todayISO();
   const segments = splitTranscript(transcript, MAP_SEGMENT_CHARS);
   console.log(`[analyze] map phase: ${segments.length} segments`);
@@ -630,7 +657,7 @@ async function analyzeLongTranscript(transcript: string, mode: string, knownPeop
   );
 
   console.log(`[analyze] reduce phase`);
-  return synthesizeSegments(chunkAnalyses, mode, knownPeople, today);
+  return synthesizeSegments(chunkAnalyses, mode, knownPeople, today, context);
 }
 
 async function summarizeSegment(transcript: string, n: number, total: number, mode: string, today: string): Promise<ChunkAnalysis> {
@@ -663,7 +690,7 @@ ${transcript}`,
   return { summary: a.summary, commitments: a.commitments, people: a.people, topics: a.topics, quotes: a.quotes, entities: a.entities };
 }
 
-async function synthesizeSegments(chunks: ChunkAnalysis[], mode: string, knownPeople: KnownPerson[], today: string): Promise<AnalysisResult> {
+async function synthesizeSegments(chunks: ChunkAnalysis[], mode: string, knownPeople: KnownPerson[], today: string, context: AnalysisContext): Promise<AnalysisResult> {
   const chunksText = chunks.map((c, i) => `### Segment ${i + 1}
 Summary: ${c.summary}
 People: ${c.people.join(", ") || "none"}
@@ -698,13 +725,13 @@ Rules:
 - Deduplicate entities but keep all unique ones
 - Match people names to known people when possible
 - The summary should tell the story of the whole conversation, not just list segment summaries
-
+${context.myNotes}${projectsPrompt(context.projects)}
 ${chunksText}`,
   );
   return normalizeAnalysis(raw);
 }
 
-async function analyzeTranscript(transcript: string, mode: string, knownPeople: KnownPerson[]): Promise<AnalysisResult> {
+async function analyzeTranscript(transcript: string, mode: string, knownPeople: KnownPerson[], context: AnalysisContext): Promise<AnalysisResult> {
   const modeInstructions: Record<string, string> = {
     general: "Extract commitments, people, topics, and notable quotes.",
     "1-on-1": "Focus on commitments between two people and relationship dynamics. Track who owes what.",
@@ -771,7 +798,7 @@ The "people" array must ONLY contain actual human beings — never companies, br
 - Topics should be specific ("Oregon flight booking" not "travel")
 - For people: use the known person's exact name if detected by name or keywords.
 - For commitments: set person_name to the specific person the commitment involves.
-
+${context.myNotes}${projectsPrompt(context.projects)}
 Transcript:
 ${transcript}`;
 
@@ -871,6 +898,7 @@ function normalizeAnalysis(raw: Record<string, unknown>): AnalysisResult {
     tags: uniqueStrings(arr(raw.tags), 8, 50),
     quotes,
     entities,
+    projects: uniqueStrings(arr(raw.projects), 5, 120),
   };
 }
 
