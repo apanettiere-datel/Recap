@@ -43,10 +43,14 @@ function formatCommitmentsForText(commitments, personName) {
 
 export default function ShareSheet({ open, onClose, note, commitments, personName }) {
   const [copied, setCopied] = useState(false)
+  const [wasOpen, setWasOpen] = useState(open)
+  if (open !== wasOpen) {
+    setWasOpen(open)
+    if (open) setCopied(false)
+  }
 
   useEffect(() => {
     if (!open) return
-    setCopied(false)
     const handleKey = (e) => {
       if (e.key === 'Escape') onClose()
     }

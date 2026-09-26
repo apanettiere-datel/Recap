@@ -1,58 +1,183 @@
 import { Hono } from "hono";
 import { db } from "../services/db.js";
 import { notes, commitments, topics, people, notePeople, quotes, tags } from "../models/schema.js";
-import { eq, and, desc, like, or, sql, inArray } from "drizzle-orm";
-import { processNote } from "../services/processing.js";
-import { writeFile, mkdir, readFile } from "node:fs/promises";
+import { eq, and, desc, ilike, or, sql, inArray, gte, lte, getTableColumns, type SQL } from "drizzle-orm";
+import { enqueueNote, isNoteQueued } from "../services/processing.js";
+import { sniffAudioFormat } from "../services/audio.js";
+import { writeFile, mkdir, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppEnv } from "../types.js";
 
 const UPLOADS_DIR = join(import.meta.dirname, "../../uploads");
+const MIN_AUDIO_BYTES = 1024;
 
 const app = new Hono<AppEnv>();
+
+type NoteRow = typeof notes.$inferSelect;
+
+/** Load commitments, topics, people, quotes and tags for many notes in 5 queries (not 5 per note). */
+async function withRelations<T extends { id: string }>(rows: T[]) {
+  if (rows.length === 0) return [];
+  const ids = rows.map((n) => n.id);
+
+  const [cRows, tRows, pRows, qRows, tagRows] = await Promise.all([
+    db.select().from(commitments).where(inArray(commitments.noteId, ids)),
+    db.select().from(topics).where(inArray(topics.noteId, ids)),
+    db
+      .select({ noteId: notePeople.noteId, person: people })
+      .from(notePeople)
+      .innerJoin(people, eq(notePeople.personId, people.id))
+      .where(inArray(notePeople.noteId, ids)),
+    db.select().from(quotes).where(inArray(quotes.noteId, ids)),
+    db.select().from(tags).where(inArray(tags.noteId, ids)),
+  ]);
+
+  const group = <R>(list: R[], key: (r: R) => string | null) => {
+    const map = new Map<string, R[]>();
+    for (const r of list) {
+      const k = key(r);
+      if (!k) continue;
+      if (!map.has(k)) map.set(k, []);
+      map.get(k)!.push(r);
+    }
+    return map;
+  };
+
+  const byC = group(cRows, (r) => r.noteId);
+  const byT = group(tRows, (r) => r.noteId);
+  const byP = group(pRows, (r) => r.noteId);
+  const byQ = group(qRows, (r) => r.noteId);
+  const byTag = group(tagRows, (r) => r.noteId);
+
+  return rows.map((note) => {
+    // The same person can be linked twice on older notes; dedupe for display
+    const seen = new Set<string>();
+    const notePeopleList = (byP.get(note.id) ?? [])
+      .map((r) => r.person)
+      .filter((p) => (seen.has(p.id) ? false : (seen.add(p.id), true)));
+    return {
+      ...note,
+      commitments: byC.get(note.id) ?? [],
+      topics: (byT.get(note.id) ?? []).map((t) => t.label),
+      people: notePeopleList,
+      quotes: byQ.get(note.id) ?? [],
+      tags: byTag.get(note.id) ?? [],
+    };
+  });
+}
+
+// List payloads skip the transcript (it can be ~100KB for a long recording)
+const { transcript: _transcript, ...listColumns } = getTableColumns(notes);
+const listSelection = {
+  ...listColumns,
+  transcriptLength: sql<number>`length(${notes.transcript})`.mapWith(Number),
+};
+
+function parseLimit(value: string | undefined, fallback: number, max: number) {
+  const n = parseInt(value ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, max) : fallback;
+}
+
+function parseOffset(value: string | undefined) {
+  const n = parseInt(value ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function extensionFor(file: File, header: Uint8Array): string {
+  const type = (file.type || "").toLowerCase();
+  if (type.includes("webm")) return "webm";
+  if (type.includes("ogg")) return "ogg";
+  if (type.includes("mp4") || type.includes("m4a") || type.includes("aac")) return "m4a";
+  if (type.includes("mpeg") || type.includes("mp3")) return "mp3";
+  if (type.includes("wav")) return "wav";
+  return sniffAudioFormat(header).ext;
+}
 
 // Upload audio and start processing
 app.post("/", async (c) => {
   const userId = c.get("userId") as string;
-  const body = await c.req.parseBody();
-  const audio = body["audio"] as File;
-  const mode = (body["mode"] as string) ?? "general";
-  const personId = (body["personId"] as string) || null;
-  const duration = parseFloat((body["duration"] as string) || "0") || 0;
 
-  if (!audio) return c.json({ error: "No audio file" }, 400);
-
-  // Save audio to local disk (preserve original format)
-  await mkdir(UPLOADS_DIR, { recursive: true });
-  const ext = audio.name?.endsWith(".webm") ? "webm" : audio.name?.split(".").pop() || "webm";
-  const filename = `${userId}_${Date.now()}.${ext}`;
-  const filePath = join(UPLOADS_DIR, filename);
-  const buffer = Buffer.from(await audio.arrayBuffer());
-  await writeFile(filePath, buffer);
-
-  const audioUrl = `file://${filePath}`;
-
-  const [note] = await db
-    .insert(notes)
-    .values({
-      userId,
-      audioUrl,
-      duration,
-      conversationMode: mode,
-    })
-    .returning();
-
-  if (personId) {
-    await db.insert(notePeople).values({ noteId: note.id, personId });
-    await db
-      .update(people)
-      .set({ lastContactDate: new Date() })
-      .where(and(eq(people.id, personId), eq(people.userId, userId)));
+  let body: Record<string, string | File>;
+  try {
+    body = await c.req.parseBody();
+  } catch (err) {
+    console.error("[upload] could not parse body:", err);
+    return c.json({ error: "The upload was incomplete or malformed. Please retry." }, 400);
   }
 
-  // Process async
-  processNote(note.id, userId).catch(console.error);
+  const audio = body["audio"];
+  const mode = typeof body["mode"] === "string" && body["mode"] ? body["mode"] : "general";
+  const personId = typeof body["personId"] === "string" && body["personId"] ? body["personId"] : null;
+  const duration = Math.max(0, parseFloat((body["duration"] as string) || "0") || 0);
+  const clientId = typeof body["clientId"] === "string" && /^[A-Za-z0-9-]{8,64}$/.test(body["clientId"]) ? body["clientId"] : null;
+  const recordedAtRaw = typeof body["recordedAt"] === "string" ? new Date(body["recordedAt"]) : null;
+  const recordedAt = recordedAtRaw && !Number.isNaN(recordedAtRaw.getTime()) && recordedAtRaw.getTime() <= Date.now() + 60_000
+    ? recordedAtRaw
+    : new Date();
+
+  if (!audio || typeof audio === "string") return c.json({ error: "No audio file was included in the upload." }, 400);
+  if (audio.size < MIN_AUDIO_BYTES) return c.json({ error: "The recording is empty — no audio was captured." }, 400);
+
+  // Idempotency: a retried upload (e.g. the response was lost) returns the original note
+  if (clientId) {
+    const [existing] = await db
+      .select({ id: notes.id, isProcessing: notes.isProcessing })
+      .from(notes)
+      .where(and(eq(notes.userId, userId), sql`${notes.audioUrl} like ${`%/${userId}_${clientId}.%`}`))
+      .limit(1);
+    if (existing) {
+      return c.json({ id: existing.id, status: existing.isProcessing ? "processing" : "done", duplicate: true }, 200);
+    }
+  }
+
+  if (personId) {
+    const [owned] = await db
+      .select({ id: people.id })
+      .from(people)
+      .where(and(eq(people.id, personId), eq(people.userId, userId)))
+      .limit(1);
+    if (!owned) return c.json({ error: "That person was not found." }, 400);
+  }
+
+  const buffer = Buffer.from(await audio.arrayBuffer());
+  const ext = extensionFor(audio, buffer.subarray(0, 16));
+  const filename = `${userId}_${clientId ?? Date.now()}.${ext}`;
+  const filePath = join(UPLOADS_DIR, filename);
+
+  try {
+    await mkdir(UPLOADS_DIR, { recursive: true });
+    await writeFile(filePath, buffer);
+  } catch (err) {
+    console.error("[upload] failed to save audio:", err);
+    return c.json({ error: "The server couldn't save your recording. Please retry." }, 507);
+  }
+
+  let note: NoteRow;
+  try {
+    [note] = await db
+      .insert(notes)
+      .values({
+        userId,
+        audioUrl: `file://${filePath}`,
+        duration,
+        conversationMode: mode,
+        recordedAt,
+        isProcessing: true,
+      })
+      .returning();
+
+    if (personId) {
+      await db.insert(notePeople).values({ noteId: note.id, personId });
+      await db.update(people).set({ lastContactDate: recordedAt }).where(eq(people.id, personId));
+    }
+  } catch (err) {
+    console.error("[upload] failed to create note:", err);
+    await unlink(filePath).catch(() => {});
+    return c.json({ error: "The server couldn't save your recording. Please retry." }, 500);
+  }
+
+  enqueueNote(note.id, userId);
 
   return c.json({ id: note.id, status: "processing" }, 201);
 });
@@ -64,8 +189,9 @@ app.post("/text", async (c) => {
     title: string;
     content: string;
     people?: string[];
-  }>();
+  }>().catch(() => null);
 
+  if (!body) return c.json({ error: "Invalid request body" }, 400);
   if (!body.title?.trim()) return c.json({ error: "Title required" }, 400);
   if (!body.content?.trim()) return c.json({ error: "Content required" }, 400);
 
@@ -84,134 +210,273 @@ app.post("/text", async (c) => {
     .returning();
 
   if (body.people?.length) {
-    await db.insert(notePeople).values(
-      body.people.map((personId) => ({ noteId: note.id, personId }))
-    );
-    await db
-      .update(people)
-      .set({ lastContactDate: new Date() })
+    const owned = await db
+      .select({ id: people.id })
+      .from(people)
       .where(and(eq(people.userId, userId), inArray(people.id, body.people)));
+    if (owned.length) {
+      await db.insert(notePeople).values(owned.map((p) => ({ noteId: note.id, personId: p.id })));
+      await db
+        .update(people)
+        .set({ lastContactDate: new Date() })
+        .where(inArray(people.id, owned.map((p) => p.id)));
+    }
   }
 
   return c.json(note, 201);
 });
 
-// Get all notes for user
+// Get notes for user. `?archived=false` excludes archived notes (default: include, for older clients).
 app.get("/", async (c) => {
   const userId = c.get("userId") as string;
-  const limit = parseInt(c.req.query("limit") ?? "50");
-  const offset = parseInt(c.req.query("offset") ?? "0");
+  const limit = parseLimit(c.req.query("limit"), 50, 200);
+  const offset = parseOffset(c.req.query("offset"));
+  const archived = c.req.query("archived");
 
-  const userNotes = await db
-    .select()
+  const conditions: SQL[] = [eq(notes.userId, userId)];
+  if (archived === "false") conditions.push(eq(notes.isArchived, false));
+
+  const rows = await db
+    .select(listSelection)
     .from(notes)
-    .where(eq(notes.userId, userId))
+    .where(and(...conditions))
     .orderBy(desc(notes.recordedAt))
     .limit(limit)
     .offset(offset);
 
-  const withRelations = await Promise.all(
-    userNotes.map(async (note) => {
-      const noteCommitments = await db
-        .select()
-        .from(commitments)
-        .where(eq(commitments.noteId, note.id));
-
-      const noteTopics = await db
-        .select()
-        .from(topics)
-        .where(eq(topics.noteId, note.id));
-
-      const notePeopleRows = await db
-        .select({ person: people })
-        .from(notePeople)
-        .innerJoin(people, eq(notePeople.personId, people.id))
-        .where(eq(notePeople.noteId, note.id));
-
-      const noteQuotes = await db
-        .select()
-        .from(quotes)
-        .where(eq(quotes.noteId, note.id));
-
-      const noteTags = await db
-        .select()
-        .from(tags)
-        .where(eq(tags.noteId, note.id));
-
-      return {
-        ...note,
-        commitments: noteCommitments,
-        topics: noteTopics.map((t) => t.label),
-        people: notePeopleRows.map((r) => r.person),
-        quotes: noteQuotes,
-        tags: noteTags,
-      };
-    })
-  );
-
-  return c.json(withRelations);
+  return c.json(await withRelations(rows));
 });
 
 // Get archived notes
 app.get("/archived", async (c) => {
   const userId = c.get("userId") as string;
-  const limit = parseInt(c.req.query("limit") ?? "50");
-  const offset = parseInt(c.req.query("offset") ?? "0");
+  const limit = parseLimit(c.req.query("limit"), 50, 200);
+  const offset = parseOffset(c.req.query("offset"));
 
-  const archivedNotes = await db
-    .select()
+  const rows = await db
+    .select(listSelection)
     .from(notes)
     .where(and(eq(notes.userId, userId), eq(notes.isArchived, true)))
     .orderBy(desc(notes.recordedAt))
     .limit(limit)
     .offset(offset);
 
-  const withRelations = await Promise.all(
-    archivedNotes.map(async (note) => {
-      const noteCommitments = await db
-        .select()
-        .from(commitments)
-        .where(eq(commitments.noteId, note.id));
-
-      const noteTopics = await db
-        .select()
-        .from(topics)
-        .where(eq(topics.noteId, note.id));
-
-      const notePeopleRows = await db
-        .select({ person: people })
-        .from(notePeople)
-        .innerJoin(people, eq(notePeople.personId, people.id))
-        .where(eq(notePeople.noteId, note.id));
-
-      const noteQuotes = await db
-        .select()
-        .from(quotes)
-        .where(eq(quotes.noteId, note.id));
-
-      const noteTags = await db
-        .select()
-        .from(tags)
-        .where(eq(tags.noteId, note.id));
-
-      return {
-        ...note,
-        commitments: noteCommitments,
-        topics: noteTopics.map((t) => t.label),
-        people: notePeopleRows.map((r) => r.person),
-        quotes: noteQuotes,
-        tags: noteTags,
-      };
-    })
-  );
-
-  return c.json(withRelations);
+  return c.json(await withRelations(rows));
 });
 
-// Get single note
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/** Split a query into terms; "quoted phrases" stay together. */
+function parseTerms(q: string): string[] {
+  const terms: string[] = [];
+  const re = /"([^"]+)"|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(q)) !== null) {
+    const t = (m[1] ?? m[2]).trim();
+    if (t && !terms.some((x) => x.toLowerCase() === t.toLowerCase())) terms.push(t);
+  }
+  return terms.slice(0, 8);
+}
+
+function likePattern(term: string) {
+  return `%${term.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+}
+
+function countOccurrences(haystack: string, needle: string) {
+  if (!needle) return 0;
+  let count = 0;
+  let i = haystack.indexOf(needle);
+  while (i !== -1) {
+    count++;
+    i = haystack.indexOf(needle, i + needle.length);
+  }
+  return count;
+}
+
+/** Up to `max` short excerpts of the transcript around matches, trimmed to word boundaries. */
+function buildSnippets(text: string, terms: string[], max = 3, radius = 90) {
+  const lower = text.toLowerCase();
+  const hits: number[] = [];
+  for (const term of terms) {
+    const t = term.toLowerCase();
+    let i = lower.indexOf(t);
+    while (i !== -1 && hits.length < 50) {
+      hits.push(i);
+      i = lower.indexOf(t, i + t.length);
+    }
+  }
+  hits.sort((a, b) => a - b);
+
+  const snippets: string[] = [];
+  let lastEnd = -1;
+  for (const hit of hits) {
+    if (hit < lastEnd) continue;
+    let start = Math.max(0, hit - radius);
+    let end = Math.min(text.length, hit + radius);
+    if (start > 0) {
+      const space = text.indexOf(" ", start);
+      if (space !== -1 && space < hit) start = space + 1;
+    }
+    if (end < text.length) {
+      const space = text.lastIndexOf(" ", end);
+      if (space > hit) end = space;
+    }
+    snippets.push(`${start > 0 ? "…" : ""}${text.slice(start, end).trim()}${end < text.length ? "…" : ""}`);
+    lastEnd = end;
+    if (snippets.length >= max) break;
+  }
+  return snippets;
+}
+
+async function searchNotes(userId: string, q: string, opts: {
+  personId?: string | null;
+  from?: Date | null;
+  to?: Date | null;
+  includeArchived?: boolean;
+  limit?: number;
+  offset?: number;
+}) {
+  const terms = parseTerms(q);
+  if (terms.length === 0) return { terms, total: 0, notes: [], people: [], commitments: [] };
+
+  const noteConditions: SQL[] = [eq(notes.userId, userId)];
+  if (!opts.includeArchived) noteConditions.push(eq(notes.isArchived, false));
+  if (opts.from) noteConditions.push(gte(notes.recordedAt, opts.from));
+  if (opts.to) noteConditions.push(lte(notes.recordedAt, opts.to));
+  if (opts.personId) {
+    noteConditions.push(sql`exists (select 1 from ${notePeople} where ${notePeople.noteId} = ${notes.id} and ${notePeople.personId} = ${opts.personId})`);
+  }
+
+  // Every term must match somewhere: title, summary, transcript, a tag, a topic, or a linked person
+  for (const term of terms) {
+    const p = likePattern(term);
+    noteConditions.push(or(
+      ilike(notes.title, p),
+      ilike(notes.summary, p),
+      ilike(notes.transcript, p),
+      sql`exists (select 1 from ${tags} where ${tags.noteId} = ${notes.id} and ${tags.label} ilike ${p})`,
+      sql`exists (select 1 from ${topics} where ${topics.noteId} = ${notes.id} and ${topics.label} ilike ${p})`,
+      sql`exists (select 1 from ${notePeople} np join ${people} pp on pp.id = np.person_id where np.note_id = ${notes.id} and pp.name ilike ${p})`,
+    )!);
+  }
+
+  // Rank a bounded candidate set in memory: title > tags/people/topics > summary > transcript, then recency
+  const candidates = await db
+    .select()
+    .from(notes)
+    .where(and(...noteConditions))
+    .orderBy(desc(notes.recordedAt))
+    .limit(300);
+
+  const enriched = await withRelations(candidates);
+  const lowerTerms = terms.map((t) => t.toLowerCase());
+
+  const scored = enriched.map((note) => {
+    const title = (note.title || "").toLowerCase();
+    const summary = (note.summary || "").toLowerCase();
+    const transcript = (note.transcript || "").toLowerCase();
+    const labels = [...note.tags.map((t) => t.label), ...note.topics, ...note.people.map((p) => p.name)].join(" ").toLowerCase();
+
+    let transcriptMatches = 0;
+    let score = 0;
+    const matchedIn = new Set<string>();
+    for (const t of lowerTerms) {
+      if (title.includes(t)) { score += 10; matchedIn.add("title"); }
+      if (labels.includes(t)) { score += 6; matchedIn.add("tags"); }
+      if (summary.includes(t)) { score += 4; matchedIn.add("summary"); }
+      const n = countOccurrences(transcript, t);
+      if (n > 0) { score += Math.min(n, 10); matchedIn.add("transcript"); }
+      transcriptMatches += n;
+    }
+    if (lowerTerms.length > 1 && transcript.includes(lowerTerms.join(" "))) score += 5;
+
+    const { transcript: fullTranscript, ...rest } = note;
+    return {
+      note: {
+        ...rest,
+        transcriptLength: fullTranscript.length,
+        matchedIn: [...matchedIn],
+        transcriptMatches,
+        // Text notes can have summary === transcript; don't repeat it as a snippet
+        snippets: transcriptMatches > 0 && fullTranscript.trim() !== (note.summary || "").trim()
+          ? buildSnippets(fullTranscript, terms)
+          : [],
+      },
+      score,
+      time: note.recordedAt.getTime(),
+    };
+  });
+
+  scored.sort((a, b) => b.score - a.score || b.time - a.time);
+
+  const limit = opts.limit ?? 30;
+  const offset = opts.offset ?? 0;
+
+  const personConditions = terms.map((t) => ilike(people.name, likePattern(t)));
+  const commitmentConditions = terms.map((t) => ilike(commitments.description, likePattern(t)));
+
+  const [matchingPeople, matchingCommitments] = await Promise.all([
+    db
+      .select()
+      .from(people)
+      .where(and(eq(people.userId, userId), or(...personConditions)))
+      .limit(10),
+    db
+      .select()
+      .from(commitments)
+      .where(and(eq(commitments.userId, userId), ...commitmentConditions))
+      .orderBy(desc(commitments.createdAt))
+      .limit(10),
+  ]);
+
+  return {
+    terms,
+    total: scored.length,
+    notes: scored.slice(offset, offset + limit).map((s) => s.note),
+    people: matchingPeople,
+    commitments: matchingCommitments,
+  };
+}
+
+function parseDateParam(v: string | undefined) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// Search: GET /notes/search?q=...&personId=&from=&to=&archived=include&limit=&offset=
+app.get("/search", async (c) => {
+  const userId = c.get("userId") as string;
+  const q = (c.req.query("q") ?? "").trim().slice(0, 200);
+  const result = await searchNotes(userId, q, {
+    personId: c.req.query("personId") || null,
+    from: parseDateParam(c.req.query("from")),
+    to: parseDateParam(c.req.query("to")),
+    includeArchived: c.req.query("archived") === "include",
+    limit: parseLimit(c.req.query("limit"), 30, 100),
+    offset: parseOffset(c.req.query("offset")),
+  });
+  return c.json({ query: q, ...result });
+});
+
+// Legacy search path used by the mobile app
+app.get("/search/:query", async (c) => {
+  const userId = c.get("userId") as string;
+  const q = decodeURIComponent(c.req.param("query") ?? "").trim().slice(0, 200);
+  const result = await searchNotes(userId, q, { includeArchived: true, limit: 20 });
+  return c.json({ notes: result.notes, people: result.people, commitments: result.commitments });
+});
+
+// ---------------------------------------------------------------------------
+// Single note
+// ---------------------------------------------------------------------------
+
 app.get("/:id", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
 
   const [note] = await db
     .select()
@@ -220,37 +485,23 @@ app.get("/:id", async (c) => {
 
   if (!note) return c.json({ error: "Not found" }, 404);
 
-  const noteCommitments = await db.select().from(commitments).where(eq(commitments.noteId, noteId));
-  const noteTopics = await db.select().from(topics).where(eq(topics.noteId, noteId));
-  const notePeopleRows = await db
-    .select({ person: people })
-    .from(notePeople)
-    .innerJoin(people, eq(notePeople.personId, people.id))
-    .where(eq(notePeople.noteId, noteId));
-  const noteQuotes = await db.select().from(quotes).where(eq(quotes.noteId, noteId));
-  const noteTags = await db.select().from(tags).where(eq(tags.noteId, noteId));
-
-  return c.json({
-    ...note,
-    commitments: noteCommitments,
-    topics: noteTopics.map((t) => t.label),
-    people: notePeopleRows.map((r) => r.person),
-    quotes: noteQuotes,
-    tags: noteTags,
-  });
+  const [withRel] = await withRelations([note]);
+  return c.json({ ...withRel, isQueued: note.isProcessing ? isNoteQueued(note.id) : false });
 });
 
 // Update note (partial)
 app.patch("/:id", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
-  const body = await c.req.json();
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") return c.json({ error: "Invalid request body" }, 400);
 
   const updates: Record<string, unknown> = {};
-  if (body.title !== undefined) updates.title = body.title;
-  if (body.summary !== undefined) updates.summary = body.summary;
-  if (body.isPinned !== undefined) updates.isPinned = body.isPinned;
-  if (body.isArchived !== undefined) updates.isArchived = body.isArchived;
+  if (typeof body.title === "string") updates.title = body.title.trim().slice(0, 200);
+  if (typeof body.summary === "string") updates.summary = body.summary;
+  if (typeof body.isPinned === "boolean") updates.isPinned = body.isPinned;
+  if (typeof body.isArchived === "boolean") updates.isArchived = body.isArchived;
 
   if (Object.keys(updates).length === 0) {
     return c.json({ error: "No fields to update" }, 400);
@@ -271,6 +522,7 @@ app.patch("/:id", async (c) => {
 app.get("/:id/audio", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
 
   const [note] = await db
     .select()
@@ -281,24 +533,14 @@ app.get("/:id/audio", async (c) => {
   if (!note.audioUrl) return c.json({ error: "No audio" }, 404);
 
   try {
-    const filePath = fileURLToPath(note.audioUrl);
-    const data = await readFile(filePath);
-
+    const data = await readFile(fileURLToPath(note.audioUrl));
     // Detect actual format from magic bytes, not file extension
-    let contentType = "audio/mp4";
-    if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) {
-      contentType = "audio/webm";
-    } else if (data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53) {
-      contentType = "audio/ogg";
-    } else if (data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46) {
-      contentType = "audio/wav";
-    }
-
+    const { mime } = sniffAudioFormat(data.subarray(0, 16));
     return new Response(data, {
       headers: {
-        "Content-Type": contentType,
+        "Content-Type": mime,
         "Content-Length": data.byteLength.toString(),
-        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=3600",
       },
     });
   } catch {
@@ -306,10 +548,12 @@ app.get("/:id/audio", async (c) => {
   }
 });
 
-// Reprocess a failed note
+// Reprocess a note. Body: { retranscribe?: boolean } — by default an existing transcript is reused.
 app.post("/:id/reprocess", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const body = await c.req.json<{ retranscribe?: boolean }>().catch(() => ({} as { retranscribe?: boolean }));
 
   const [note] = await db
     .select()
@@ -317,86 +561,62 @@ app.post("/:id/reprocess", async (c) => {
     .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
 
   if (!note) return c.json({ error: "Not found" }, 404);
-  if (!note.audioUrl) return c.json({ error: "No audio to process" }, 400);
+  if (!note.audioUrl && !note.transcript.trim()) return c.json({ error: "Nothing to process" }, 400);
+  if (isNoteQueued(noteId)) return c.json({ error: "This note is already being processed." }, 409);
 
   await db
     .update(notes)
-    .set({ isProcessing: true, processingError: null })
+    .set({ isProcessing: true, processingError: null, processingStage: "Queued", processingStartedAt: null })
     .where(eq(notes.id, noteId));
 
-  processNote(noteId, userId).catch(console.error);
+  enqueueNote(noteId, userId, { retranscribe: !!body?.retranscribe });
 
   return c.json({ id: noteId, status: "processing" });
 });
 
-// Delete note
+// Delete note (and its audio file)
 app.delete("/:id", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
 
-  await db.delete(notes).where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  const [deleted] = await db
+    .delete(notes)
+    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)))
+    .returning({ audioUrl: notes.audioUrl });
+
+  if (deleted?.audioUrl?.startsWith("file://")) {
+    await unlink(fileURLToPath(deleted.audioUrl)).catch(() => {});
+  }
   return c.json({ ok: true });
-});
-
-// Search across notes
-app.get("/search/:query", async (c) => {
-  const userId = c.get("userId") as string;
-  const query = c.req.param("query");
-  const pattern = `%${query}%`;
-
-  const matchingNotes = await db
-    .select()
-    .from(notes)
-    .where(
-      and(
-        eq(notes.userId, userId),
-        or(
-          like(notes.title, pattern),
-          like(notes.summary, pattern),
-          like(notes.transcript, pattern)
-        )
-      )
-    )
-    .orderBy(desc(notes.recordedAt))
-    .limit(20);
-
-  const matchingPeople = await db
-    .select()
-    .from(people)
-    .where(and(eq(people.userId, userId), like(people.name, pattern)))
-    .limit(10);
-
-  const matchingCommitments = await db
-    .select()
-    .from(commitments)
-    .where(and(eq(commitments.userId, userId), like(commitments.description, pattern)))
-    .limit(10);
-
-  return c.json({
-    notes: matchingNotes,
-    people: matchingPeople,
-    commitments: matchingCommitments,
-  });
 });
 
 // Add tag to note
 app.post("/:id/tags", async (c) => {
   const userId = c.get("userId") as string;
   const noteId = c.req.param("id");
-  const { label } = await c.req.json<{ label: string }>();
+  if (!isUuid(noteId)) return c.json({ error: "Not found" }, 404);
+  const body = await c.req.json<{ label: string }>().catch(() => null);
+  const label = body?.label?.trim().slice(0, 50);
 
-  if (!label?.trim()) return c.json({ error: "Label required" }, 400);
+  if (!label) return c.json({ error: "Label required" }, 400);
 
-  // Verify note belongs to user
   const [note] = await db
-    .select()
+    .select({ id: notes.id })
     .from(notes)
     .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
   if (!note) return c.json({ error: "Not found" }, 404);
 
+  const [existing] = await db
+    .select()
+    .from(tags)
+    .where(and(eq(tags.noteId, noteId), sql`lower(${tags.label}) = ${label.toLowerCase()}`))
+    .limit(1);
+  if (existing) return c.json(existing, 200);
+
   const [tag] = await db
     .insert(tags)
-    .values({ userId, noteId, label: label.trim() })
+    .values({ userId, noteId, label })
     .returning();
 
   return c.json(tag, 201);
@@ -406,9 +626,14 @@ app.post("/:id/tags", async (c) => {
 app.delete("/:id/tags/:tagId", async (c) => {
   const userId = c.get("userId") as string;
   const tagId = c.req.param("tagId");
+  if (!isUuid(tagId)) return c.json({ error: "Not found" }, 404);
 
   await db.delete(tags).where(and(eq(tags.id, tagId), eq(tags.userId, userId)));
   return c.json({ ok: true });
 });
+
+function isUuid(v: string | undefined): v is string {
+  return !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+}
 
 export default app;

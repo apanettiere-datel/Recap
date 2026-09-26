@@ -58,7 +58,7 @@ export function validateContentLength(maxBytes: number) {
   return async (c: Context, next: Next) => {
     const contentLength = c.req.header("content-length");
     if (contentLength && parseInt(contentLength) > maxBytes) {
-      return c.json({ error: `Request too large. Max ${maxBytes} bytes.` }, 413);
+      return c.json({ error: `This recording is too large to upload (max ${Math.round(maxBytes / 1024 / 1024)}MB).` }, 413);
     }
     await next();
   };
@@ -69,6 +69,6 @@ export async function errorHandler(c: Context, next: Next) {
     await next();
   } catch (error) {
     console.error("Unhandled error:", error);
-    return c.json({ error: "Internal server error" }, 500);
+    return c.json({ error: "Something went wrong on our end. Please try again." }, 500);
   }
 }

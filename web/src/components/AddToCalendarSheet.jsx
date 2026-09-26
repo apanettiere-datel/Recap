@@ -85,14 +85,13 @@ export default function AddToCalendarSheet({ open, commitment, onClose, onAdded 
   const [selectedDate, setSelectedDate] = useState(null)
   const [showProviders, setShowProviders] = useState(false)
 
-  useEffect(() => {
-    if (open && commitment?.dueDate) {
-      setSelectedDate(new Date(commitment.dueDate))
-    } else if (open) {
-      setSelectedDate(null)
-    }
+  // Reset the picker whenever the sheet opens or targets a different commitment
+  const [synced, setSynced] = useState({ open, commitment })
+  if (synced.open !== open || synced.commitment !== commitment) {
+    setSynced({ open, commitment })
+    if (open) setSelectedDate(commitment?.dueDate ? new Date(commitment.dueDate) : null)
     setShowProviders(false)
-  }, [open, commitment])
+  }
 
   useEffect(() => {
     if (!open) return

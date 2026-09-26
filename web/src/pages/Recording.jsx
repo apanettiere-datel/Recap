@@ -1,21 +1,41 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { useApi } from '@/lib/api'
+import { toast } from '@/lib/toast'
+import { formatClock, formatBytes } from '@/lib/format'
+import {
+  newSessionId, createSession, appendChunk, updateSession, deleteSession,
+  notifyRecordingsChanged, markUploading, unmarkUploading,
+} from '@/lib/recordingStore'
+import { uploadRecording, downloadBlob, extensionForMime } from '@/lib/uploadRecording'
 
 const MAX_RECORDING_SECONDS = 2 * 60 * 60 // 2 hours
+const LIMIT_WARNING_SECONDS = MAX_RECORDING_SECONDS - 5 * 60
+const MIN_RECORDING_SECONDS = 1
+const SILENCE_WARNING_MS = 8000
+const BAR_COUNT = 40
 
-function formatTime(seconds) {
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  if (h > 0) {
-    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+const MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg']
+
+function pickMimeType() {
+  for (const t of MIME_CANDIDATES) {
+    if (window.MediaRecorder?.isTypeSupported?.(t)) return t
   }
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  return '' // let the browser choose
 }
 
-const BAR_COUNT = 40
+function describeMediaError(err, kind) {
+  const name = err?.name
+  if (kind === 'display') {
+    if (name === 'NotAllowedError' || name === 'AbortError') return 'Tab sharing was cancelled. Choose a browser tab and tick "Share tab audio" to capture the meeting.'
+    return "Couldn't start tab capture. Meeting mode works in Chrome and Edge on desktop."
+  }
+  if (name === 'NotAllowedError' || name === 'SecurityError') return 'Microphone access is blocked. Allow microphone access for this site in your browser settings, then try again.'
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No microphone was found. Connect a microphone and try again.'
+  if (name === 'NotReadableError' || name === 'AbortError') return 'Your microphone is in use by another app or not responding. Close other apps using it and try again.'
+  return err?.message ? `Couldn't start recording: ${err.message}` : "Couldn't start recording."
+}
 
 export default function Recording() {
   const navigate = useNavigate()
@@ -24,417 +44,756 @@ export default function Recording() {
   const api = useApi()
   const queryClient = useQueryClient()
 
-  const [mode, setMode] = useState(null) // null = choosing, 'voice' | 'meeting'
-  const [status, setStatus] = useState('idle') // idle | recording | uploading
+  // choose | starting | recording | paused | finalizing | uploading | failed | error
+  const [phase, setPhase] = useState('choose')
+  const [mode, setMode] = useState(null)
   const [elapsed, setElapsed] = useState(0)
   const [levels, setLevels] = useState(() => new Array(BAR_COUNT).fill(0))
   const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null)
+  const [silent, setSilent] = useState(false)
+  const [backupOk, setBackupOk] = useState(true)
+  const [upload, setUpload] = useState({ progress: 0, attempt: 0, size: 0 })
 
-  const mediaRecorderRef = useRef(null)
-  const chunksRef = useRef([])
-  const streamRef = useRef(null)
-  const displayStreamRef = useRef(null)
-  const analyserRef = useRef(null)
-  const animFrameRef = useRef(null)
-  const timerRef = useRef(null)
+  const recorderRef = useRef(null)
+  const streamsRef = useRef([])
   const audioCtxRef = useRef(null)
+  const rafRef = useRef(null)
+  const tickRef = useRef(null)
+  const wakeLockRef = useRef(null)
+  const sessionRef = useRef(null) // { id, mimeType, startedAt }
+  const chunksRef = useRef([])
+  const seqRef = useRef(0)
+  const accumulatedMsRef = useRef(0)
+  const segmentStartRef = useRef(null)
+  const lastSoundAtRef = useRef(0)
+  const finalizedRef = useRef(false)
+  const discardRef = useRef(false)
+  const blobRef = useRef(null)
+  const mountedRef = useRef(true)
+  const phaseRef = useRef('choose')
+  const limitWarnedRef = useRef(false)
 
-  const uploadMutation = useMutation({
-    mutationFn: async (blob) => {
-      const formData = new FormData()
-      formData.append('audio', blob, 'recording.webm')
-      formData.append('mode', 'conversation')
-      formData.append('duration', String(elapsed))
-      if (personId) {
-        formData.append('personId', personId)
+  const go = (p) => { phaseRef.current = p; setPhase(p) }
+
+  const elapsedMs = () => accumulatedMsRef.current + (segmentStartRef.current ? Date.now() - segmentStartRef.current : 0)
+
+  // ---------------------------------------------------------------------------
+  // Media lifecycle
+  // ---------------------------------------------------------------------------
+
+  function releaseMedia() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = null
+    if (tickRef.current) clearInterval(tickRef.current)
+    tickRef.current = null
+    for (const s of streamsRef.current) s.getTracks().forEach((t) => { t.onended = null; t.stop() })
+    streamsRef.current = []
+    audioCtxRef.current?.close().catch(() => {})
+    audioCtxRef.current = null
+    wakeLockRef.current?.release?.().catch(() => {})
+    wakeLockRef.current = null
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+        wakeLockRef.current = await navigator.wakeLock.request('screen')
       }
-      return api.upload('/notes', formData)
-    },
-    onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ['notes'] })
-      if (personId) {
-        queryClient.invalidateQueries({ queryKey: ['person', personId] })
-      }
-      navigate(data?.id ? `/note/${data.id}` : '/')
-    },
-    onError: (err) => {
-      setError(err.message || 'Upload failed')
-      setStatus('idle')
-    },
-  })
-
-  const cleanup = useCallback(() => {
-    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
-    if (timerRef.current) clearInterval(timerRef.current)
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop())
-      streamRef.current = null
+    } catch {
+      // Not critical — the recording continues if the screen sleeps on most devices
     }
-    if (displayStreamRef.current) {
-      displayStreamRef.current.getTracks().forEach((t) => t.stop())
-      displayStreamRef.current = null
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {})
-      audioCtxRef.current = null
-    }
-    mediaRecorderRef.current = null
-    analyserRef.current = null
-  }, [])
+  }
 
-  useEffect(() => {
-    return cleanup
-  }, [cleanup])
-
-  const startVisualizer = useCallback((analyser) => {
-    const dataArray = new Uint8Array(analyser.frequencyBinCount)
+  function startVisualizer(analyser) {
+    const data = new Uint8Array(analyser.frequencyBinCount)
     const tick = () => {
-      analyser.getByteFrequencyData(dataArray)
-      const step = Math.floor(dataArray.length / BAR_COUNT)
+      analyser.getByteFrequencyData(data)
+      const step = Math.max(1, Math.floor(data.length / BAR_COUNT))
       const bars = []
+      let total = 0
       for (let i = 0; i < BAR_COUNT; i++) {
         let sum = 0
-        for (let j = 0; j < step; j++) {
-          sum += dataArray[i * step + j]
-        }
-        bars.push((sum / step) / 255)
+        for (let j = 0; j < step; j++) sum += data[i * step + j] || 0
+        const v = sum / step / 255
+        bars.push(v)
+        total += v
       }
+      if (total / BAR_COUNT > 0.03) lastSoundAtRef.current = Date.now()
       setLevels(bars)
-      animFrameRef.current = requestAnimationFrame(tick)
+      rafRef.current = requestAnimationFrame(tick)
     }
     tick()
-  }, [])
+  }
 
-  const startVoiceRecording = useCallback(async () => {
+  async function start(selectedMode) {
+    setMode(selectedMode)
     setError(null)
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      streamRef.current = stream
+    setNotice(null)
+    go('starting')
 
-      const audioCtx = new AudioContext()
-      audioCtxRef.current = audioCtx
-      const source = audioCtx.createMediaStreamSource(stream)
-      const analyser = audioCtx.createAnalyser()
-      analyser.fftSize = 128
-      analyser.smoothingTimeConstant = 0.7
-      source.connect(analyser)
-      analyserRef.current = analyser
-
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm'
-      const recorder = new MediaRecorder(stream, { mimeType })
-      mediaRecorderRef.current = recorder
-      chunksRef.current = []
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data)
-      }
-
-      recorder.start(1000)
-      setStatus('recording')
-      setElapsed(0)
-
-      timerRef.current = setInterval(() => {
-        setElapsed((prev) => prev + 1)
-      }, 1000)
-
-      startVisualizer(analyser)
-    } catch {
-      setError('Microphone access denied. Please allow microphone access and try again.')
-      cleanup()
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setError("This browser can't record audio. Try the latest Chrome, Edge, Firefox or Safari.")
+      go('error')
+      return
     }
-  }, [cleanup, startVisualizer])
 
-  const startMeetingRecording = useCallback(async () => {
-    setError(null)
+    let mic
     try {
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      streamRef.current = micStream
+      mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      })
+    } catch (err) {
+      setError(describeMediaError(err, 'mic'))
+      go('error')
+      return
+    }
+    streamsRef.current = [mic]
 
-      let displayStream
-      try {
-        displayStream = await navigator.mediaDevices.getDisplayMedia({
-          audio: true,
-          video: true,
-        })
-      } catch {
-        setError('Tab sharing cancelled. Select a browser tab to capture meeting audio.')
-        micStream.getTracks().forEach((t) => t.stop())
-        streamRef.current = null
-        return
-      }
+    let recordStream = mic
+    const watchTracks = [...mic.getAudioTracks()]
 
-      displayStreamRef.current = displayStream
-
-      const displayAudioTracks = displayStream.getAudioTracks()
-      if (displayAudioTracks.length === 0) {
-        setError('No audio from shared tab. Make sure to check "Share tab audio" when sharing.')
-        micStream.getTracks().forEach((t) => t.stop())
-        displayStream.getTracks().forEach((t) => t.stop())
-        streamRef.current = null
-        displayStreamRef.current = null
-        return
-      }
-
-      // Stop the video track — we only need audio
-      displayStream.getVideoTracks().forEach((t) => t.stop())
-
-      const audioCtx = new AudioContext()
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
       audioCtxRef.current = audioCtx
-
-      const micSource = audioCtx.createMediaStreamSource(micStream)
-      const tabSource = audioCtx.createMediaStreamSource(
-        new MediaStream(displayAudioTracks)
-      )
-
-      const dest = audioCtx.createMediaStreamDestination()
-      micSource.connect(dest)
-      tabSource.connect(dest)
-
+      if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => {})
       const analyser = audioCtx.createAnalyser()
       analyser.fftSize = 128
       analyser.smoothingTimeConstant = 0.7
+      const micSource = audioCtx.createMediaStreamSource(mic)
       micSource.connect(analyser)
-      tabSource.connect(analyser)
-      analyserRef.current = analyser
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm'
-      const recorder = new MediaRecorder(dest.stream, { mimeType })
-      mediaRecorderRef.current = recorder
-      chunksRef.current = []
+      if (selectedMode === 'meeting') {
+        let display
+        try {
+          if (!navigator.mediaDevices.getDisplayMedia) throw Object.assign(new Error('unsupported'), { name: 'NotSupportedError' })
+          display = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
+        } catch (err) {
+          releaseMedia()
+          setError(describeMediaError(err, 'display'))
+          go('error')
+          return
+        }
+        streamsRef.current.push(display)
+        const tabAudio = display.getAudioTracks()
+        if (tabAudio.length === 0) {
+          releaseMedia()
+          setError('The shared tab has no audio. Share again and make sure "Share tab audio" is switched on.')
+          go('error')
+          return
+        }
+        // Only the audio is needed
+        display.getVideoTracks().forEach((t) => t.stop())
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data)
+        const tabSource = audioCtx.createMediaStreamSource(new MediaStream(tabAudio))
+        tabSource.connect(analyser)
+        const dest = audioCtx.createMediaStreamDestination()
+        micSource.connect(dest)
+        tabSource.connect(dest)
+        recordStream = dest.stream
+        watchTracks.push(...tabAudio)
       }
-
-      // If the user stops sharing the tab, stop the recording
-      displayAudioTracks[0].onended = () => {
-        stopRecording()
-      }
-
-      recorder.start(1000)
-      setStatus('recording')
-      setElapsed(0)
-
-      timerRef.current = setInterval(() => {
-        setElapsed((prev) => prev + 1)
-      }, 1000)
 
       startVisualizer(analyser)
+    } catch (err) {
+      // The visualizer is optional in voice mode; meeting mode needs the audio graph
+      console.warn('[recording] audio graph setup failed:', err)
+      if (selectedMode === 'meeting') {
+        releaseMedia()
+        setError("Couldn't set up meeting capture in this browser. Try Chrome or Edge.")
+        go('error')
+        return
+      }
+    }
+
+    const mimeType = pickMimeType()
+    let recorder
+    try {
+      recorder = new MediaRecorder(recordStream, mimeType ? { mimeType, audioBitsPerSecond: 64000 } : undefined)
+    } catch (err) {
+      releaseMedia()
+      setError(`This browser couldn't start the recorder${err?.message ? ` (${err.message})` : ''}.`)
+      go('error')
+      return
+    }
+
+    const session = {
+      id: newSessionId(),
+      mimeType: recorder.mimeType || mimeType || 'audio/webm',
+      mode: selectedMode,
+      personId: personId || null,
+      startedAt: new Date().toISOString(),
+    }
+    sessionRef.current = session
+    chunksRef.current = []
+    seqRef.current = 0
+    finalizedRef.current = false
+    discardRef.current = false
+    blobRef.current = null
+    accumulatedMsRef.current = 0
+    segmentStartRef.current = Date.now()
+    lastSoundAtRef.current = Date.now()
+    limitWarnedRef.current = false
+
+    try {
+      await createSession(session)
+      setBackupOk(true)
+      notifyRecordingsChanged()
     } catch {
-      setError('Failed to start meeting recording. Make sure you\'re using Chrome or Edge.')
-      cleanup()
-    }
-  }, [cleanup, startVisualizer])
-
-  const stopRecording = useCallback(() => {
-    const recorder = mediaRecorderRef.current
-    if (!recorder || recorder.state === 'inactive') return
-
-    recorder.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: recorder.mimeType })
-      cleanup()
-      setStatus('uploading')
-      uploadMutation.mutate(blob)
+      setBackupOk(false)
     }
 
-    recorder.stop()
-    if (timerRef.current) clearInterval(timerRef.current)
-    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
-  }, [cleanup, uploadMutation])
+    recorder.ondataavailable = (e) => {
+      if (!e.data || e.data.size === 0 || discardRef.current) return
+      chunksRef.current.push(e.data)
+      const seq = seqRef.current++
+      appendChunk(session.id, seq, e.data, elapsedMs() / 1000).catch(() => setBackupOk(false))
+    }
+    recorder.onstop = () => onRecorderStopped()
+    recorder.onerror = (e) => {
+      console.error('[recording] recorder error:', e?.error || e)
+      finish('The recorder stopped unexpectedly. Everything captured up to that point was saved.')
+    }
+
+    for (const track of watchTracks) {
+      track.onended = () => {
+        if (!['recording', 'paused'].includes(phaseRef.current)) return
+        const isTab = selectedMode === 'meeting' && track !== mic.getAudioTracks()[0]
+        finish(isTab
+          ? 'Tab sharing ended, so the recording was stopped and saved.'
+          : 'Your microphone was disconnected, so the recording was stopped and saved.')
+      }
+    }
+
+    recorderRef.current = recorder
+    try {
+      recorder.start(1000)
+    } catch (err) {
+      releaseMedia()
+      setError(`Couldn't start the recorder${err?.message ? ` (${err.message})` : ''}.`)
+      go('error')
+      deleteSession(session.id).catch(() => {})
+      return
+    }
+
+    setElapsed(0)
+    go('recording')
+    requestWakeLock()
+
+    tickRef.current = setInterval(() => {
+      const secs = Math.floor(elapsedMs() / 1000)
+      setElapsed(secs)
+      if (phaseRef.current === 'recording' && document.visibilityState === 'visible') {
+        setSilent(Date.now() - lastSoundAtRef.current > SILENCE_WARNING_MS)
+      }
+      if (secs >= LIMIT_WARNING_SECONDS && !limitWarnedRef.current) {
+        limitWarnedRef.current = true
+        setNotice('5 minutes left — recordings stop automatically at 2 hours.')
+      }
+      if (secs >= MAX_RECORDING_SECONDS) {
+        finish('You reached the 2-hour limit, so the recording was stopped and saved.')
+      }
+    }, 250)
+  }
+
+  function pause() {
+    const r = recorderRef.current
+    if (!r || r.state !== 'recording') return
+    try {
+      r.pause()
+      r.requestData?.()
+    } catch {
+      return
+    }
+    accumulatedMsRef.current += Date.now() - (segmentStartRef.current || Date.now())
+    segmentStartRef.current = null
+    setSilent(false)
+    go('paused')
+  }
+
+  function resume() {
+    const r = recorderRef.current
+    if (!r || r.state !== 'paused') return
+    try {
+      r.resume()
+    } catch {
+      return
+    }
+    segmentStartRef.current = Date.now()
+    lastSoundAtRef.current = Date.now()
+    go('recording')
+  }
+
+  /** Stop recording and save. Safe to call more than once and from any trigger. */
+  function finish(message) {
+    if (finalizedRef.current || !['recording', 'paused'].includes(phaseRef.current)) return
+    if (message) setNotice(message)
+    if (segmentStartRef.current) {
+      accumulatedMsRef.current += Date.now() - segmentStartRef.current
+      segmentStartRef.current = null
+    }
+    go('finalizing')
+    const r = recorderRef.current
+    if (r && r.state !== 'inactive') {
+      try {
+        r.stop() // → ondataavailable (final chunk) → onstop → onRecorderStopped
+        return
+      } catch {
+        // fall through and finalize with what we have
+      }
+    }
+    onRecorderStopped()
+  }
+
+  async function onRecorderStopped() {
+    if (finalizedRef.current) return
+    finalizedRef.current = true
+    // The recorder can stop on its own (e.g. the mic's track ended) without finish() running
+    if (segmentStartRef.current) {
+      accumulatedMsRef.current += Date.now() - segmentStartRef.current
+      segmentStartRef.current = null
+    }
+    if (phaseRef.current !== 'finalizing' && mountedRef.current) go('finalizing')
+    releaseMedia()
+
+    const session = sessionRef.current
+    if (discardRef.current || !session) return
+
+    const durationSec = Math.round(accumulatedMsRef.current / 1000)
+    const blob = new Blob(chunksRef.current, { type: session.mimeType })
+    blobRef.current = blob
+
+    if (blob.size === 0 || durationSec < MIN_RECORDING_SECONDS) {
+      deleteSession(session.id).catch(() => {})
+      notifyRecordingsChanged()
+      if (!mountedRef.current) return
+      setError('That recording was too short or captured no audio. Check your microphone and try again.')
+      go('error')
+      return
+    }
+
+    await updateSession(session.id, { status: 'stopped', duration: durationSec }).catch(() => {})
+    notifyRecordingsChanged()
+    if (mountedRef.current) await doUpload()
+  }
+
+  async function doUpload() {
+    const session = sessionRef.current
+    const blob = blobRef.current
+    if (!session || !blob) return
+    const durationSec = Math.round(accumulatedMsRef.current / 1000)
+
+    setError(null)
+    setUpload({ progress: 0, attempt: 0, size: blob.size })
+    if (mountedRef.current) go('uploading')
+    markUploading(session.id)
+
+    try {
+      const note = await uploadRecording(api, {
+        blob,
+        clientId: session.id,
+        mode: 'conversation',
+        duration: durationSec,
+        personId: session.personId,
+        recordedAt: session.startedAt,
+      }, {
+        onProgress: (p) => mountedRef.current && setUpload((u) => ({ ...u, progress: p })),
+        onRetry: (attempt) => mountedRef.current && setUpload((u) => ({ ...u, attempt, progress: 0 })),
+      })
+
+      await deleteSession(session.id).catch(() => {})
+      queryClient.invalidateQueries({ queryKey: ['notes'] })
+      if (session.personId) queryClient.invalidateQueries({ queryKey: ['person', session.personId] })
+
+      if (mountedRef.current) {
+        navigate(note?.id ? `/note/${note.id}` : '/', { replace: true })
+      } else {
+        toast.success('Your recording was uploaded and is being processed.')
+      }
+    } catch (err) {
+      const message = err?.message || 'Upload failed.'
+      await updateSession(session.id, { status: 'failed', error: message }).catch(() => {})
+      if (mountedRef.current) {
+        setError(message)
+        go('failed')
+      } else {
+        toast.error('A recording failed to upload. It is saved on this device — open Recap to retry.')
+      }
+    } finally {
+      unmarkUploading(session.id)
+      notifyRecordingsChanged()
+    }
+  }
+
+  async function discard() {
+    const secs = Math.floor(elapsedMs() / 1000)
+    const active = ['recording', 'paused', 'failed', 'finalizing'].includes(phaseRef.current)
+    if (active && secs >= 3 && !window.confirm('Discard this recording? This cannot be undone.')) return
+
+    discardRef.current = true
+    finalizedRef.current = true
+    const r = recorderRef.current
+    if (r && r.state !== 'inactive') {
+      r.onstop = null
+      try { r.stop() } catch { /* already stopped */ }
+    }
+    releaseMedia()
+    if (sessionRef.current) {
+      await deleteSession(sessionRef.current.id).catch(() => {})
+      notifyRecordingsChanged()
+    }
+    navigate('/', { replace: true })
+  }
+
+  function saveForLater() {
+    toast.info('Saved on this device. You can upload it from the banner at the top of Recap.')
+    navigate('/', { replace: true })
+  }
+
+  function downloadAudio() {
+    if (!blobRef.current || !sessionRef.current) return
+    const stamp = sessionRef.current.startedAt.replace(/[:.]/g, '-').slice(0, 19)
+    downloadBlob(blobRef.current, `recap-recording-${stamp}.${extensionForMime(blobRef.current.type)}`)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page lifecycle
+  // ---------------------------------------------------------------------------
 
   useEffect(() => {
-    if (elapsed >= MAX_RECORDING_SECONDS && status === 'recording') {
-      stopRecording()
+    mountedRef.current = true
+    const onBeforeUnload = (e) => {
+      if (['recording', 'paused', 'finalizing', 'uploading'].includes(phaseRef.current)) {
+        e.preventDefault()
+        e.returnValue = ''
+      }
     }
-  }, [elapsed, status, stopRecording])
-
-  const cancelRecording = useCallback(() => {
-    const recorder = mediaRecorderRef.current
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.onstop = () => {}
-      recorder.stop()
+    // Flush buffered audio to storage before the page can be frozen or killed
+    const onPageHide = () => {
+      const r = recorderRef.current
+      if (r && r.state === 'recording') {
+        try { r.requestData() } catch { /* ignore */ }
+      }
     }
-    cleanup()
-    navigate(-1)
-  }, [cleanup, navigate])
-
-  const selectMode = useCallback((selectedMode) => {
-    setMode(selectedMode)
-    if (selectedMode === 'voice') {
-      startVoiceRecording()
-    } else {
-      startMeetingRecording()
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        lastSoundAtRef.current = Date.now()
+        if (phaseRef.current === 'recording' && !wakeLockRef.current) requestWakeLock()
+      } else {
+        onPageHide()
+      }
     }
-  }, [startVoiceRecording, startMeetingRecording])
+    window.addEventListener('beforeunload', onBeforeUnload)
+    window.addEventListener('pagehide', onPageHide)
+    document.addEventListener('visibilitychange', onVisibility)
 
-  if (status === 'uploading') {
+    return () => {
+      mountedRef.current = false
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('pagehide', onPageHide)
+      document.removeEventListener('visibilitychange', onVisibility)
+
+      // Left the page mid-recording (e.g. browser back): stop and keep what was captured
+      const r = recorderRef.current
+      if (r && r.state !== 'inactive' && !finalizedRef.current) {
+        finalizedRef.current = true
+        const session = sessionRef.current
+        r.onstop = () => {
+          if (session && !discardRef.current) {
+            updateSession(session.id, { status: 'stopped', duration: Math.round(elapsedMs() / 1000) })
+              .catch(() => {})
+              .finally(notifyRecordingsChanged)
+          }
+        }
+        try { r.stop() } catch { /* ignore */ }
+        toast.info('Recording stopped. It was saved on this device — upload it from the banner.')
+      }
+      releaseMedia()
+    }
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  const accent = mode === 'meeting' ? 'blue' : 'red'
+
+  if (phase === 'choose') {
     return (
-      <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center">
-        <div className="w-12 h-12 border-3 border-blue-500 border-t-transparent rounded-full animate-spin mb-6" />
-        <p className="text-neutral-900 dark:text-white text-lg font-semibold">Processing your recording...</p>
-        <p className="text-neutral-500 dark:text-neutral-400 text-sm mt-2">This may take a moment</p>
-      </div>
-    )
-  }
+      <Screen>
+        <TopBar onCancel={() => navigate(-1)} />
+        <div className="w-full max-w-sm flex flex-col items-center">
+          <h1 className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 tracking-tight">New recording</h1>
+          <p className="text-neutral-500 dark:text-neutral-400 text-sm mb-8">What are you recording?</p>
 
-  if (!mode) {
-    return (
-      <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center px-6">
-        <button
-          type="button"
-          onClick={() => navigate(-1)}
-          className="absolute top-6 left-6 text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white text-sm font-medium transition-colors"
-        >
-          Cancel
-        </button>
+          <div className="flex flex-col gap-3 w-full">
+            <ModeButton
+              color="red"
+              title="Voice note"
+              subtitle="In-person conversation or a note to self"
+              icon={<MicIcon className="w-6 h-6" />}
+              onClick={() => start('voice')}
+            />
+            <ModeButton
+              color="blue"
+              title="Online meeting"
+              subtitle="Your mic plus audio from a browser tab (Zoom, Meet, Teams)"
+              icon={<MonitorIcon className="w-6 h-6" />}
+              onClick={() => start('meeting')}
+            />
+          </div>
 
-        <h1 className="text-2xl font-bold text-neutral-900 dark:text-white mb-2 tracking-tight">New Recording</h1>
-        <p className="text-neutral-500 dark:text-neutral-400 text-sm mb-10">What are you recording?</p>
-
-        <div className="flex flex-col gap-4 w-full max-w-xs">
-          <button
-            type="button"
-            onClick={() => selectMode('voice')}
-            className="flex items-center gap-4 p-5 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-neutral-400 dark:hover:border-neutral-600 transition-colors text-left"
-          >
-            <div className="w-12 h-12 rounded-full bg-red-500/15 flex items-center justify-center flex-shrink-0">
-              <svg className="w-6 h-6 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
-              </svg>
-            </div>
-            <div>
-              <p className="text-base font-semibold text-neutral-900 dark:text-white">Voice Note</p>
-              <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">Record from your microphone</p>
-            </div>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => selectMode('meeting')}
-            className="flex items-center gap-4 p-5 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-neutral-400 dark:hover:border-neutral-600 transition-colors text-left"
-          >
-            <div className="w-12 h-12 rounded-full bg-blue-500/15 flex items-center justify-center flex-shrink-0">
-              <svg className="w-6 h-6 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a9 9 0 01-9 9m0 0a9 9 0 01-9-9" />
-              </svg>
-            </div>
-            <div>
-              <p className="text-base font-semibold text-neutral-900 dark:text-white">Meeting</p>
-              <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">Capture mic + browser tab audio</p>
-            </div>
-          </button>
+          <ul className="mt-8 text-xs text-neutral-400 dark:text-neutral-500 space-y-1.5 text-left w-full">
+            <li className="flex gap-2"><Dot />Recordings are backed up on this device as you go, so nothing is lost if the page closes.</li>
+            <li className="flex gap-2"><Dot />Up to 2 hours per recording. You can pause and resume.</li>
+            <li className="flex gap-2"><Dot />Meeting mode works in Chrome and Edge on desktop.</li>
+          </ul>
         </div>
-
-        <p className="text-neutral-400 dark:text-neutral-600 text-xs mt-8 text-center max-w-xs">
-          Meeting mode captures audio from a shared browser tab (Zoom, Teams, Meet) plus your microphone.
-          Works in Chrome and Edge.
-        </p>
-      </div>
+      </Screen>
     )
   }
 
-  return (
-    <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center">
-      {/* Cancel */}
-      <button
-        type="button"
-        onClick={cancelRecording}
-        className="absolute top-6 left-6 text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white text-sm font-medium transition-colors"
-      >
-        Cancel
-      </button>
+  if (phase === 'error') {
+    return (
+      <Screen>
+        <TopBar onCancel={() => navigate('/', { replace: true })} label="Close" />
+        <div className="w-full max-w-sm text-center">
+          <div className="w-14 h-14 rounded-full bg-red-500/15 text-red-500 flex items-center justify-center mx-auto mb-5">
+            <AlertIcon className="w-7 h-7" />
+          </div>
+          <h1 className="text-xl font-semibold text-neutral-900 dark:text-white mb-2">Couldn&apos;t record</h1>
+          <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-8 leading-relaxed">{error}</p>
+          <div className="flex flex-col gap-2">
+            <button type="button" onClick={() => start(mode || 'voice')} className="btn-primary">Try again</button>
+            <button type="button" onClick={() => { setError(null); go('choose') }} className="btn-ghost">Choose a different mode</button>
+          </div>
+        </div>
+      </Screen>
+    )
+  }
 
-      {/* Mode badge */}
-      <div className="absolute top-6 right-6">
-        <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
-          mode === 'meeting'
-            ? 'bg-blue-500/15 text-blue-500 dark:text-blue-400'
-            : 'bg-red-500/15 text-red-500 dark:text-red-400'
-        }`}>
-          {mode === 'meeting' ? (
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a9 9 0 01-9 9m0 0a9 9 0 01-9-9" />
-            </svg>
-          ) : (
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
-            </svg>
+  if (phase === 'uploading' || phase === 'finalizing') {
+    const pct = Math.round(upload.progress * 100)
+    return (
+      <Screen>
+        <div className="w-full max-w-sm text-center">
+          <div className="w-12 h-12 border-[3px] border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-6" />
+          <p className="text-lg font-semibold text-neutral-900 dark:text-white">
+            {phase === 'finalizing' ? 'Saving recording…' : pct >= 100 ? 'Finishing upload…' : 'Uploading recording…'}
+          </p>
+          <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-1">
+            {formatClock(elapsed)} recorded{upload.size ? ` · ${formatBytes(upload.size)}` : ''}
+          </p>
+          {phase === 'uploading' && (
+            <div className="mt-6 h-1.5 w-full rounded-full bg-neutral-200 dark:bg-neutral-800 overflow-hidden">
+              <div className="h-full bg-blue-500 transition-[width] duration-300" style={{ width: `${Math.max(3, pct)}%` }} />
+            </div>
           )}
+          {upload.attempt > 0 && (
+            <p className="text-xs text-amber-600 dark:text-amber-400 mt-3">
+              Connection problem — retrying (attempt {upload.attempt + 1})…
+            </p>
+          )}
+          {notice && <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-4">{notice}</p>}
+          <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-6">
+            Your recording is saved on this device until the upload completes.
+          </p>
+        </div>
+      </Screen>
+    )
+  }
+
+  if (phase === 'failed') {
+    return (
+      <Screen>
+        <div className="w-full max-w-sm text-center">
+          <div className="w-14 h-14 rounded-full bg-amber-500/15 text-amber-500 flex items-center justify-center mx-auto mb-5">
+            <CloudIcon className="w-7 h-7" />
+          </div>
+          <h1 className="text-xl font-semibold text-neutral-900 dark:text-white mb-2">Upload didn&apos;t finish</h1>
+          <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-2 leading-relaxed">{error}</p>
+          <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-8">
+            Your {formatClock(elapsed)} recording is safe on this device.
+          </p>
+          <div className="flex flex-col gap-2">
+            <button type="button" onClick={doUpload} className="btn-primary">Retry upload</button>
+            <button type="button" onClick={saveForLater} className="btn-secondary">Upload later</button>
+            <button type="button" onClick={downloadAudio} className="btn-ghost">Download audio file</button>
+            <button type="button" onClick={discard} className="btn-ghost text-red-500 dark:text-red-400">Discard recording</button>
+          </div>
+        </div>
+      </Screen>
+    )
+  }
+
+  // starting | recording | paused
+  const isPaused = phase === 'paused'
+  return (
+    <Screen>
+      <TopBar onCancel={discard} label="Discard">
+        <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+          accent === 'blue' ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'
+        }`}>
+          {mode === 'meeting' ? <MonitorIcon className="w-3.5 h-3.5" /> : <MicIcon className="w-3.5 h-3.5" />}
           {mode === 'meeting' ? 'Meeting' : 'Voice'}
         </span>
-      </div>
+      </TopBar>
 
-      {error && (
-        <div className="absolute top-6 left-1/2 -translate-x-1/2 bg-red-500/20 text-red-400 px-4 py-2 rounded-xl text-sm max-w-sm text-center">
-          {error}
+      <div className="flex flex-col items-center w-full max-w-md">
+        <div className="min-h-[3.5rem] mb-4 flex flex-col items-center gap-2 px-4">
+          {!backupOk && phase !== 'starting' && (
+            <Banner tone="amber">Local backup isn&apos;t available (private browsing?). Keep this tab open until the upload finishes.</Banner>
+          )}
+          {silent && !isPaused && (
+            <Banner tone="amber">We&apos;re not hearing anything. Check that your microphone is on and unmuted.</Banner>
+          )}
+          {notice && <Banner tone="neutral">{notice}</Banner>}
         </div>
-      )}
 
-      {/* Timer */}
-      <div className="mb-8">
-        <p className="text-5xl font-light text-neutral-900 dark:text-white tabular-nums tracking-wide">
-          {formatTime(elapsed)}
+        <p className="text-6xl font-extralight text-neutral-900 dark:text-white tabular-nums tracking-tight">
+          {formatClock(elapsed)}
         </p>
-        {status === 'recording' && (
-          <div className="flex items-center justify-center gap-2 mt-3">
-            <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-            <span className="text-sm text-red-400 font-medium">Recording</span>
-          </div>
-        )}
-      </div>
+        <div className="h-6 mt-3 flex items-center justify-center gap-2">
+          {phase === 'starting' && <span className="text-sm text-neutral-500">Starting…</span>}
+          {phase === 'recording' && (
+            <>
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-sm text-red-500 dark:text-red-400 font-medium">Recording</span>
+            </>
+          )}
+          {isPaused && <span className="text-sm text-amber-600 dark:text-amber-400 font-medium">Paused</span>}
+        </div>
 
-      {/* Waveform */}
-      <div className="flex items-center justify-center gap-[2px] h-24 mb-12 px-6 w-full max-w-md">
-        {levels.map((level, i) => (
-          <div
-            key={i}
-            className={`flex-1 max-w-[6px] rounded-full transition-all duration-75 ${
-              mode === 'meeting' ? 'bg-blue-500' : 'bg-red-500'
-            }`}
-            style={{
-              height: `${Math.max(4, level * 96)}px`,
-              opacity: 0.4 + level * 0.6,
-            }}
-          />
-        ))}
-      </div>
+        <div className="flex items-center justify-center gap-[3px] h-28 my-8 px-6 w-full" aria-hidden="true">
+          {levels.map((level, i) => (
+            <div
+              key={i}
+              className={`flex-1 max-w-[6px] rounded-full transition-[height] duration-75 ${accent === 'blue' ? 'bg-blue-500' : 'bg-red-500'}`}
+              style={{ height: `${Math.max(4, (isPaused ? 0 : level) * 112)}px`, opacity: isPaused ? 0.25 : 0.35 + level * 0.65 }}
+            />
+          ))}
+        </div>
 
-      {/* Controls */}
-      <div className="flex items-center gap-8">
-        {status === 'idle' && !error && (
+        <div className="flex items-center justify-center gap-6">
           <button
             type="button"
-            onClick={mode === 'meeting' ? startMeetingRecording : startVoiceRecording}
-            className="w-20 h-20 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center transition-colors active:scale-95"
+            onClick={isPaused ? resume : pause}
+            disabled={phase === 'starting'}
+            className="w-14 h-14 rounded-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-neutral-700 dark:text-neutral-200 flex items-center justify-center hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors disabled:opacity-40"
+            aria-label={isPaused ? 'Resume' : 'Pause'}
           >
-            <div className="w-7 h-7 rounded-full bg-white" />
+            {isPaused ? <PlayIcon className="w-6 h-6" /> : <PauseIcon className="w-6 h-6" />}
           </button>
-        )}
-
-        {status === 'recording' && (
           <button
             type="button"
-            onClick={stopRecording}
-            className="w-20 h-20 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center transition-colors active:scale-95 ring-4 ring-red-500/30"
+            onClick={() => finish()}
+            disabled={phase === 'starting'}
+            className="w-20 h-20 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center transition active:scale-95 ring-4 ring-red-500/25 disabled:opacity-40"
+            aria-label="Stop and save"
           >
             <div className="w-7 h-7 rounded-md bg-white" />
           </button>
-        )}
-
-        {status === 'idle' && error && (
-          <button
-            type="button"
-            onClick={() => { setMode(null); setError(null) }}
-            className="px-6 py-3 rounded-full bg-blue-500 text-white font-semibold hover:bg-blue-600 transition-colors"
-          >
-            Try Again
-          </button>
-        )}
+          <div className="w-14" />
+        </div>
+        <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-6">Tap the square to stop and save</p>
       </div>
+    </Screen>
+  )
+}
+
+function Screen({ children }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-neutral-50 dark:bg-neutral-950 flex flex-col items-center justify-center px-6 overflow-y-auto">
+      {children}
     </div>
+  )
+}
+
+function TopBar({ onCancel, label = 'Cancel', children }) {
+  return (
+    <div className="absolute top-0 inset-x-0 flex items-center justify-between px-5 pt-[calc(1.25rem+env(safe-area-inset-top,0px))]">
+      <button type="button" onClick={onCancel} className="text-sm font-medium text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white transition-colors">
+        {label}
+      </button>
+      {children}
+    </div>
+  )
+}
+
+function Banner({ tone, children }) {
+  const tones = {
+    amber: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+    neutral: 'bg-neutral-200/70 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300',
+  }
+  return <div className={`px-4 py-2 rounded-xl text-xs text-center max-w-sm ${tones[tone]}`}>{children}</div>
+}
+
+function ModeButton({ color, title, subtitle, icon, onClick }) {
+  const tint = color === 'blue' ? 'bg-blue-500/15 text-blue-500' : 'bg-red-500/15 text-red-500'
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-4 p-4 rounded-2xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 hover:border-neutral-400 dark:hover:border-neutral-600 transition-colors text-left"
+    >
+      <div className={`w-12 h-12 rounded-full flex items-center justify-center shrink-0 ${tint}`}>{icon}</div>
+      <div>
+        <p className="text-base font-semibold text-neutral-900 dark:text-white">{title}</p>
+        <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">{subtitle}</p>
+      </div>
+    </button>
+  )
+}
+
+function Dot() {
+  return <span className="mt-1.5 w-1 h-1 rounded-full bg-neutral-400 shrink-0" />
+}
+
+function MicIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
+    </svg>
+  )
+}
+
+function MonitorIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a9 9 0 01-9 9m0 0a9 9 0 01-9-9" />
+    </svg>
+  )
+}
+
+function PauseIcon({ className }) {
+  return (
+    <svg className={className} fill="currentColor" viewBox="0 0 24 24">
+      <rect x="6" y="5" width="4" height="14" rx="1" />
+      <rect x="14" y="5" width="4" height="14" rx="1" />
+    </svg>
+  )
+}
+
+function PlayIcon({ className }) {
+  return (
+    <svg className={className} fill="currentColor" viewBox="0 0 24 24">
+      <path d="M8 5.14v13.72a1 1 0 001.5.86l11.04-6.86a1 1 0 000-1.72L9.5 4.28A1 1 0 008 5.14z" />
+    </svg>
+  )
+}
+
+function AlertIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+    </svg>
+  )
+}
+
+function CloudIcon({ className }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
+    </svg>
   )
 }

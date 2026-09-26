@@ -32,11 +32,11 @@ export default function AudioPlayer({ audioUrl, duration: initialDuration }) {
 
   const progress = duration > 0 ? currentTime / duration : 0
 
-  const updateTime = useCallback(() => {
+  const updateTime = useCallback(function loop() {
     if (audioRef.current) {
       setCurrentTime(audioRef.current.currentTime)
     }
-    animRef.current = requestAnimationFrame(updateTime)
+    animRef.current = requestAnimationFrame(loop)
   }, [])
 
   useEffect(() => {

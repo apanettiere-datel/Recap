@@ -35,6 +35,8 @@ export const notes = pgTable("notes", {
   conversationMode: text("conversation_mode").default("general").notNull(),
   isProcessing: boolean("is_processing").default(true).notNull(),
   processingError: text("processing_error"),
+  processingStage: text("processing_stage"),
+  processingStartedAt: timestamp("processing_started_at"),
   isPinned: boolean("is_pinned").default(false).notNull(),
   isArchived: boolean("is_archived").default(false).notNull(),
   recordedAt: timestamp("recorded_at").defaultNow().notNull(),

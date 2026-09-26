@@ -1,6 +1,7 @@
 import React, { Suspense, useEffect } from 'react'
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import Layout from './components/Layout'
+import ErrorBoundary from './components/ErrorBoundary'
 import { useAuthFetch } from './lib/authFetch'
 import { SignedIn, SignedOut, RedirectToSignIn, SignIn, SignUp } from '@clerk/clerk-react'
 
@@ -25,14 +26,15 @@ const Entities = React.lazy(() => import('./pages/Entities'))
 
 function Loading() {
   return (
-    <div className="flex items-center justify-center h-screen">
-      <div className="text-gray-400 text-sm">Loading...</div>
+    <div className="flex items-center justify-center h-full min-h-[50vh]">
+      <div className="w-6 h-6 border-2 border-neutral-300 dark:border-neutral-700 border-t-transparent rounded-full animate-spin" />
     </div>
   )
 }
 
 function AppRoutes() {
   return (
+    <ErrorBoundary>
     <Suspense fallback={<Loading />}>
       <Routes>
         <Route element={<Layout />}>
@@ -61,6 +63,7 @@ function AppRoutes() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>
+    </ErrorBoundary>
   )
 }
 
@@ -86,7 +89,7 @@ function UserSync() {
   const authFetch = useAuthFetch()
   useEffect(() => {
     authFetch(`${API_BASE}/api/users/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' } }).catch(() => {})
-  }, [])
+  }, [authFetch])
   return null
 }
 

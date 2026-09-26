@@ -1,7 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useApi } from '@/lib/api'
 import { useNavigate } from 'react-router-dom'
-import { useState } from 'react'
 
 const AVATAR_COLORS = [
   'bg-blue-500', 'bg-purple-500', 'bg-pink-500', 'bg-teal-500',
